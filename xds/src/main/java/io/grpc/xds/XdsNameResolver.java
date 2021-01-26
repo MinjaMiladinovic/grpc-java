@@ -1,657 +1,1243 @@
-/*
- * Copyright 2019 The gRPC Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+package mindustry.input;
 
-package io.grpc.xds;
+import arc.*;
+import arc.func.*;
+import arc.graphics.*;
+import arc.graphics.g2d.*;
+import arc.input.*;
+import arc.input.GestureDetector.*;
+import arc.math.*;
+import arc.math.geom.*;
+import arc.scene.*;
+import arc.scene.event.*;
+import arc.scene.ui.layout.*;
+import arc.struct.*;
+import arc.util.*;
+import mindustry.ai.formations.patterns.*;
+import mindustry.annotations.Annotations.*;
+import mindustry.content.*;
+import mindustry.core.*;
+import mindustry.entities.*;
+import mindustry.entities.units.*;
+import mindustry.game.EventType.*;
+import mindustry.game.*;
+import mindustry.game.Teams.*;
+import mindustry.gen.*;
+import mindustry.graphics.*;
+import mindustry.input.Placement.*;
+import mindustry.net.Administration.*;
+import mindustry.net.*;
+import mindustry.type.*;
+import mindustry.ui.fragments.*;
+import mindustry.world.*;
+import mindustry.world.blocks.*;
+import mindustry.world.blocks.ConstructBlock.*;
+import mindustry.world.blocks.payloads.*;
+import mindustry.world.blocks.power.*;
+import mindustry.world.blocks.storage.CoreBlock.*;
+import mindustry.world.meta.*;
 
-import static com.google.common.base.Preconditions.checkArgument;
-import static com.google.common.base.Preconditions.checkNotNull;
+import java.util.*;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.collect.Sets;
-import com.google.gson.Gson;
-import io.grpc.Attributes;
-import io.grpc.CallOptions;
-import io.grpc.Channel;
-import io.grpc.ClientCall;
-import io.grpc.ClientInterceptor;
-import io.grpc.ForwardingClientCall.SimpleForwardingClientCall;
-import io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener;
-import io.grpc.InternalConfigSelector;
-import io.grpc.InternalLogId;
-import io.grpc.LoadBalancer.PickSubchannelArgs;
-import io.grpc.Metadata;
-import io.grpc.MethodDescriptor;
-import io.grpc.NameResolver;
-import io.grpc.Status;
-import io.grpc.SynchronizationContext;
-import io.grpc.internal.GrpcUtil;
-import io.grpc.internal.ObjectPool;
-import io.grpc.xds.EnvoyProtoData.ClusterWeight;
-import io.grpc.xds.EnvoyProtoData.Route;
-import io.grpc.xds.EnvoyProtoData.RouteAction;
-import io.grpc.xds.EnvoyProtoData.VirtualHost;
-import io.grpc.xds.ThreadSafeRandom.ThreadSafeRandomImpl;
-import io.grpc.xds.XdsClient.LdsResourceWatcher;
-import io.grpc.xds.XdsClient.LdsUpdate;
-import io.grpc.xds.XdsClient.RdsResourceWatcher;
-import io.grpc.xds.XdsClient.RdsUpdate;
-import io.grpc.xds.XdsLogger.XdsLogLevel;
-import io.grpc.xds.XdsNameResolverProvider.CallCounterProvider;
-import io.grpc.xds.XdsNameResolverProvider.XdsClientPoolFactory;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.atomic.AtomicInteger;
-import javax.annotation.Nullable;
+import static mindustry.Vars.*;
 
-/**
- * A {@link NameResolver} for resolving gRPC target names with "xds:" scheme.
- *
- * <p>Resolving a gRPC target involves contacting the control plane management server via xDS
- * protocol to retrieve service information and produce a service config to the caller.
- *
- * @see XdsNameResolverProvider
- */
-final class XdsNameResolver extends NameResolver {
+public abstract class InputHandler implements InputProcessor, GestureListener{
+    /** Used for dropping items. */
+    final static float playerSelectRange = mobile ? 17f : 11f;
+    /** Maximum line length. */
+    final static int maxLength = 100;
+    final static Rect r1 = new Rect(), r2 = new Rect();
+    final static Seq<Point2> tmpPoints = new Seq<>(), tmpPoints2 = new Seq<>();
 
-  static final CallOptions.Key<String> CLUSTER_SELECTION_KEY =
-      CallOptions.Key.create("io.grpc.xds.CLUSTER_SELECTION_KEY");
-  @VisibleForTesting
-  static boolean enableTimeout =
-      Boolean.parseBoolean(System.getenv("GRPC_XDS_EXPERIMENTAL_ENABLE_TIMEOUT"));
+    public final OverlayFragment frag = new OverlayFragment();
 
-  private final XdsLogger logger;
-  private final String authority;
-  private final ServiceConfigParser serviceConfigParser;
-  private final SynchronizationContext syncContext;
-  private final XdsClientPoolFactory xdsClientPoolFactory;
-  private final ThreadSafeRandom random;
-  private final ConcurrentMap<String, AtomicInteger> clusterRefs = new ConcurrentHashMap<>();
-  private final ConfigSelector configSelector = new ConfigSelector();
+    public Interval controlInterval = new Interval();
+    public @Nullable Block block;
+    public boolean overrideLineRotation;
+    public int rotation;
+    public boolean droppingItem;
+    public Group uiGroup;
+    public boolean isBuilding = true, buildWasAutoPaused = false, wasShooting = false;
+    public @Nullable UnitType controlledType;
 
-  private volatile RoutingConfig routingConfig = RoutingConfig.empty;
-  private Listener2 listener;
-  private ObjectPool<XdsClient> xdsClientPool;
-  private XdsClient xdsClient;
-  private CallCounterProvider callCounterProvider;
-  private ResolveState resolveState;
+    public @Nullable Schematic lastSchematic;
+    public GestureDetector detector;
+    public PlaceLine line = new PlaceLine();
+    public BuildPlan resultreq;
+    public BuildPlan brequest = new BuildPlan();
+    public Seq<BuildPlan> lineRequests = new Seq<>();
+    public Seq<BuildPlan> selectRequests = new Seq<>();
 
-  XdsNameResolver(String name, ServiceConfigParser serviceConfigParser,
-      SynchronizationContext syncContext) {
-    this(name, serviceConfigParser, syncContext, SharedXdsClientPoolProvider.getDefaultProvider(),
-        ThreadSafeRandomImpl.instance);
-  }
+    //methods to override
 
-  @VisibleForTesting
-  XdsNameResolver(String name, ServiceConfigParser serviceConfigParser,
-      SynchronizationContext syncContext, XdsClientPoolFactory xdsClientPoolFactory,
-      ThreadSafeRandom random) {
-    authority = GrpcUtil.checkAuthority(checkNotNull(name, "name"));
-    this.serviceConfigParser = checkNotNull(serviceConfigParser, "serviceConfigParser");
-    this.syncContext = checkNotNull(syncContext, "syncContext");
-    this.xdsClientPoolFactory = checkNotNull(xdsClientPoolFactory, "xdsClientPoolFactory");
-    this.random = checkNotNull(random, "random");
-    logger = XdsLogger.withLogId(InternalLogId.allocate("xds-resolver", name));
-    logger.log(XdsLogLevel.INFO, "Created resolver for {0}", name);
-  }
-
-  @Override
-  public String getServiceAuthority() {
-    return authority;
-  }
-
-  @Override
-  public void start(Listener2 listener) {
-    this.listener = checkNotNull(listener, "listener");
-    try {
-      xdsClientPool = xdsClientPoolFactory.getXdsClientPool();
-    } catch (Exception e) {
-      listener.onError(
-          Status.UNAVAILABLE.withDescription("Failed to initialize xDS").withCause(e));
-      return;
+    @Remote(called = Loc.server, unreliable = true)
+    public static void transferItemEffect(Item item, float x, float y, Itemsc to){
+        if(to == null) return;
+        createItemTransfer(item, 1, x, y, to, null);
     }
-    xdsClient = xdsClientPool.getObject();
-    callCounterProvider = SharedCallCounterMap.getInstance();
-    resolveState = new ResolveState();
-    resolveState.start();
-  }
 
-  @Override
-  public void shutdown() {
-    logger.log(XdsLogLevel.INFO, "Shutdown");
-    if (resolveState != null) {
-      resolveState.stop();
-    }
-    if (xdsClient != null) {
-      xdsClient = xdsClientPool.returnObject(xdsClient);
-    }
-  }
+    @Remote(called = Loc.server, unreliable = true)
+    public static void takeItems(Building build, Item item, int amount, Unit to){
+        if(to == null || build == null) return;
 
-  @VisibleForTesting
-  static Map<String, ?> generateServiceConfigWithMethodTimeoutConfig(long timeoutNano) {
-    String timeout = timeoutNano / 1_000_000_000.0 + "s";
-    Map<String, Object> methodConfig = new HashMap<>();
-    methodConfig.put(
-        "name", Collections.singletonList(Collections.emptyMap()));
-    methodConfig.put("timeout", timeout);
-    return Collections.singletonMap(
-        "methodConfig", Collections.singletonList(Collections.unmodifiableMap(methodConfig)));
-  }
+        int removed = build.removeStack(item, Math.min(to.maxAccepted(item), amount));
+        if(removed == 0) return;
 
-  @VisibleForTesting
-  static Map<String, ?> generateServiceConfigWithLoadBalancingConfig(Collection<String> clusters) {
-    Map<String, Object> childPolicy = new HashMap<>();
-    for (String cluster : clusters) {
-      List<Map<String, Map<String, String>>> lbPolicy =
-          Collections.singletonList(
-              Collections.singletonMap(
-                  "cds_experimental", Collections.singletonMap("cluster", cluster)));
-      childPolicy.put(cluster, Collections.singletonMap("lbPolicy", lbPolicy));
-    }
-    return Collections.singletonMap("loadBalancingConfig",
-        Collections.singletonList(
-            Collections.singletonMap(
-                "cluster_manager_experimental", Collections.singletonMap(
-                    "childPolicy", Collections.unmodifiableMap(childPolicy)))));
-  }
-
-  @VisibleForTesting
-  XdsClient getXdsClient() {
-    return xdsClient;
-  }
-
-  private void updateResolutionResult() {
-    Map<String, ?> rawServiceConfig =
-        generateServiceConfigWithLoadBalancingConfig(clusterRefs.keySet());
-    if (logger.isLoggable(XdsLogLevel.INFO)) {
-      logger.log(
-          XdsLogLevel.INFO, "Generated service config:\n{0}", new Gson().toJson(rawServiceConfig));
-    }
-    ConfigOrError parsedServiceConfig = serviceConfigParser.parseServiceConfig(rawServiceConfig);
-    Attributes attrs =
-        Attributes.newBuilder()
-            .set(InternalXdsAttributes.XDS_CLIENT_POOL, xdsClientPool)
-            .set(InternalXdsAttributes.CALL_COUNTER_PROVIDER, callCounterProvider)
-            .set(InternalConfigSelector.KEY, configSelector)
-            .build();
-    ResolutionResult result =
-        ResolutionResult.newBuilder()
-            .setAttributes(attrs)
-            .setServiceConfig(parsedServiceConfig)
-            .build();
-    listener.onResult(result);
-  }
-
-  @VisibleForTesting
-  @Nullable
-  static VirtualHost findVirtualHostForHostName(List<VirtualHost> virtualHosts, String hostName) {
-    // Domain search order:
-    //  1. Exact domain names: ``www.foo.com``.
-    //  2. Suffix domain wildcards: ``*.foo.com`` or ``*-bar.foo.com``.
-    //  3. Prefix domain wildcards: ``foo.*`` or ``foo-*``.
-    //  4. Special wildcard ``*`` matching any domain.
-    //
-    //  The longest wildcards match first.
-    //  Assuming only a single virtual host in the entire route configuration can match
-    //  on ``*`` and a domain must be unique across all virtual hosts.
-    int matchingLen = -1; // longest length of wildcard pattern that matches host name
-    boolean exactMatchFound = false;  // true if a virtual host with exactly matched domain found
-    VirtualHost targetVirtualHost = null;  // target VirtualHost with longest matched domain
-    for (VirtualHost vHost : virtualHosts) {
-      for (String domain : vHost.getDomains()) {
-        boolean selected = false;
-        if (matchHostName(hostName, domain)) { // matching
-          if (!domain.contains("*")) { // exact matching
-            exactMatchFound = true;
-            targetVirtualHost = vHost;
-            break;
-          } else if (domain.length() > matchingLen) { // longer matching pattern
-            selected = true;
-          } else if (domain.length() == matchingLen && domain.startsWith("*")) { // suffix matching
-            selected = true;
-          }
+        to.addItem(item, removed);
+        for(int j = 0; j < Mathf.clamp(removed / 3, 1, 8); j++){
+            Time.run(j * 3f, () -> transferItemEffect(item, build.x, build.y, to));
         }
-        if (selected) {
-          matchingLen = domain.length();
-          targetVirtualHost = vHost;
+    }
+
+    @Remote(called = Loc.server, unreliable = true)
+    public static void transferItemToUnit(Item item, float x, float y, Itemsc to){
+        if(to == null) return;
+        createItemTransfer(item, 1, x, y, to, () -> to.addItem(item));
+    }
+
+    @Remote(called = Loc.server, unreliable = true)
+    public static void setItem(Building build, Item item, int amount){
+        if(build == null || build.items == null) return;
+        build.items.set(item, amount);
+    }
+
+    @Remote(called = Loc.server, unreliable = true)
+    public static void transferItemTo(@Nullable Unit unit, Item item, int amount, float x, float y, Building build){
+        if(build == null || build.items == null) return;
+
+        if(unit != null && unit.item() == item) unit.stack.amount = Math.max(unit.stack.amount - amount, 0);
+
+        for(int i = 0; i < Mathf.clamp(amount / 3, 1, 8); i++){
+            Time.run(i * 3, () -> createItemTransfer(item, amount, x, y, build, () -> {}));
         }
-      }
-      if (exactMatchFound) {
-        break;
-      }
-    }
-    return targetVirtualHost;
-  }
-
-  /**
-   * Returns {@code true} iff {@code hostName} matches the domain name {@code pattern} with
-   * case-insensitive.
-   *
-   * <p>Wildcard pattern rules:
-   * <ol>
-   * <li>A single asterisk (*) matches any domain.</li>
-   * <li>Asterisk (*) is only permitted in the left-most or the right-most part of the pattern,
-   *     but not both.</li>
-   * </ol>
-   */
-  @VisibleForTesting
-  static boolean matchHostName(String hostName, String pattern) {
-    checkArgument(hostName.length() != 0 && !hostName.startsWith(".") && !hostName.endsWith("."),
-        "Invalid host name");
-    checkArgument(pattern.length() != 0 && !pattern.startsWith(".") && !pattern.endsWith("."),
-        "Invalid pattern/domain name");
-
-    hostName = hostName.toLowerCase(Locale.US);
-    pattern = pattern.toLowerCase(Locale.US);
-    // hostName and pattern are now in lower case -- domain names are case-insensitive.
-
-    if (!pattern.contains("*")) {
-      // Not a wildcard pattern -- hostName and pattern must match exactly.
-      return hostName.equals(pattern);
-    }
-    // Wildcard pattern
-
-    if (pattern.length() == 1) {
-      return true;
+        build.handleStack(item, amount, unit);
     }
 
-    int index = pattern.indexOf('*');
-
-    // At most one asterisk (*) is allowed.
-    if (pattern.indexOf('*', index + 1) != -1) {
-      return false;
-    }
-
-    // Asterisk can only match prefix or suffix.
-    if (index != 0 && index != pattern.length() - 1) {
-      return false;
-    }
-
-    // HostName must be at least as long as the pattern because asterisk has to
-    // match one or more characters.
-    if (hostName.length() < pattern.length()) {
-      return false;
-    }
-
-    if (index == 0 && hostName.endsWith(pattern.substring(1))) {
-      // Prefix matching fails.
-      return true;
-    }
-
-    // Pattern matches hostname if suffix matching succeeds.
-    return index == pattern.length() - 1
-        && hostName.startsWith(pattern.substring(0, pattern.length() - 1));
-  }
-
-  private final class ConfigSelector extends InternalConfigSelector {
-    @Override
-    public Result selectConfig(PickSubchannelArgs args) {
-      // Index ASCII headers by keys.
-      Map<String, Iterable<String>> asciiHeaders = new HashMap<>();
-      Metadata headers = args.getHeaders();
-      for (String headerName : headers.keys()) {
-        if (headerName.endsWith(Metadata.BINARY_HEADER_SUFFIX)) {
-          continue;
+    public static void createItemTransfer(Item item, int amount, float x, float y, Position to, Runnable done){
+        Fx.itemTransfer.at(x, y, amount, item.color, to);
+        if(done != null){
+            Time.run(Fx.itemTransfer.lifetime, done);
         }
-        Metadata.Key<String> key = Metadata.Key.of(headerName, Metadata.ASCII_STRING_MARSHALLER);
-        asciiHeaders.put(headerName, headers.getAll(key));
-      }
-      String cluster = null;
-      Route selectedRoute = null;
-      do {
-        for (Route route : routingConfig.routes) {
-          if (route.getRouteMatch().matches(
-              "/" + args.getMethodDescriptor().getFullMethodName(), asciiHeaders)) {
-            selectedRoute = route;
-            break;
-          }
+    }
+
+    @Remote(called = Loc.server, targets = Loc.both, forward = true)
+    public static void requestItem(Player player, Building tile, Item item, int amount){
+        if(player == null || tile == null || !tile.interactable(player.team()) || !player.within(tile, buildingRange) || player.dead()) return;
+
+        if(net.server() && (!Units.canInteract(player, tile) ||
+        !netServer.admins.allowAction(player, ActionType.withdrawItem, tile.tile(), action -> {
+            action.item = item;
+            action.itemAmount = amount;
+        }))){
+            throw new ValidateException(player, "Player cannot request items.");
         }
-        if (selectedRoute == null) {
-          return Result.forError(
-              Status.UNAVAILABLE.withDescription("Could not find xDS route matching RPC"));
-        }
-        RouteAction action = selectedRoute.getRouteAction();
-        if (action.getCluster() != null) {
-          cluster = action.getCluster();
-        } else if (action.getWeightedCluster() != null) {
-          int totalWeight = 0;
-          for (ClusterWeight weightedCluster : action.getWeightedCluster()) {
-            totalWeight += weightedCluster.getWeight();
-          }
-          int select = random.nextInt(totalWeight);
-          int accumulator = 0;
-          for (ClusterWeight weightedCluster : action.getWeightedCluster()) {
-            accumulator += weightedCluster.getWeight();
-            if (select < accumulator) {
-              cluster = weightedCluster.getName();
-              break;
+
+        //remove item for every controlling unit
+        player.unit().eachGroup(unit -> {
+            Call.takeItems(tile, item, unit.maxAccepted(item), unit);
+
+            if(unit == player.unit()){
+                Events.fire(new WithdrawEvent(tile, player, item, amount));
             }
-          }
-        }
-      } while (!retainCluster(cluster));
-      // TODO(chengyuanzhang): avoid service config generation and parsing for each call.
-      Map<String, ?> rawServiceConfig = Collections.emptyMap();
-      if (enableTimeout) {
-        Long timeoutNano = selectedRoute.getRouteAction().getTimeoutNano();
-        if (timeoutNano == null) {
-          timeoutNano = routingConfig.fallbackTimeoutNano;
-        }
-        if (timeoutNano > 0) {
-          rawServiceConfig = generateServiceConfigWithMethodTimeoutConfig(timeoutNano);
-        }
-      }
-      ConfigOrError parsedServiceConfig = serviceConfigParser.parseServiceConfig(rawServiceConfig);
-      Object config = parsedServiceConfig.getConfig();
-      if (config == null) {
-        releaseCluster(cluster);
-        return Result.forError(
-            parsedServiceConfig.getError().augmentDescription(
-                "Failed to parse service config (method config)"));
-      }
-      final String finalCluster = cluster;
-
-      class ClusterSelectionInterceptor implements ClientInterceptor {
-        @Override
-        public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
-            MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
-          CallOptions callOptionsForCluster =
-              callOptions.withOption(CLUSTER_SELECTION_KEY, finalCluster);
-          return new SimpleForwardingClientCall<ReqT, RespT>(
-              next.newCall(method, callOptionsForCluster)) {
-            @Override
-            public void start(Listener<RespT> listener, Metadata headers) {
-              listener = new SimpleForwardingClientCallListener<RespT>(listener) {
-                boolean committed;
-
-                @Override
-                public void onHeaders(Metadata headers) {
-                  committed = true;
-                  releaseCluster(finalCluster);
-                  delegate().onHeaders(headers);
-                }
-
-                @Override
-                public void onClose(Status status, Metadata trailers) {
-                  if (!committed) {
-                    releaseCluster(finalCluster);
-                  }
-                  delegate().onClose(status, trailers);
-                }
-              };
-              delegate().start(listener, headers);
-            }
-          };
-        }
-      }
-
-      return
-          Result.newBuilder()
-              .setConfig(config)
-              .setInterceptor(new ClusterSelectionInterceptor())
-              .build();
+        });
     }
 
-    private boolean retainCluster(String cluster) {
-      AtomicInteger refCount = clusterRefs.get(cluster);
-      if (refCount == null) {
+    @Remote(targets = Loc.both, forward = true, called = Loc.server)
+    public static void transferInventory(Player player, Building tile){
+        if(player == null || tile == null || !player.within(tile, buildingRange) || tile.items == null || player.dead()) return;
+
+        if(net.server() && (player.unit().stack.amount <= 0 || !Units.canInteract(player, tile) ||
+        !netServer.admins.allowAction(player, ActionType.depositItem, tile.tile, action -> {
+            action.itemAmount = player.unit().stack.amount;
+            action.item = player.unit().item();
+        }))){
+            throw new ValidateException(player, "Player cannot transfer an item.");
+        }
+
+        //deposit for every controlling unit
+        player.unit().eachGroup(unit -> {
+            Item item = unit.item();
+            int accepted = tile.acceptStack(item, unit.stack.amount, unit);
+
+            Call.transferItemTo(unit, item, accepted, unit.x, unit.y, tile);
+
+            if(unit == player.unit()){
+                Events.fire(new DepositEvent(tile, player, item, accepted));
+            }
+        });
+    }
+
+    @Remote(variants = Variant.one)
+    public static void removeQueueBlock(int x, int y, boolean breaking){
+        player.unit().removeBuild(x, y, breaking);
+    }
+
+    @Remote(targets = Loc.both, called = Loc.server)
+    public static void requestUnitPayload(Player player, Unit target){
+        if(player == null) return;
+
+        Unit unit = player.unit();
+        Payloadc pay = (Payloadc)unit;
+
+        if(target.isAI() && target.isGrounded() && pay.canPickup(target)
+        && target.within(unit, unit.type.hitSize * 2f + target.type.hitSize * 2f)){
+            Call.pickedUnitPayload(unit, target);
+        }
+    }
+
+    @Remote(targets = Loc.both, called = Loc.server)
+    public static void requestBuildPayload(Player player, Building tile){
+        if(player == null) return;
+
+        Unit unit = player.unit();
+        Payloadc pay = (Payloadc)unit;
+
+        if(tile != null && tile.team == unit.team
+        && unit.within(tile, tilesize * tile.block.size * 1.2f + tilesize * 5f)){
+            //pick up block directly
+            if(tile.block.buildVisibility != BuildVisibility.hidden && tile.canPickup() && pay.canPickup(tile)){
+                Call.pickedBuildPayload(unit, tile, true);
+            }else{ //pick up block payload
+                Payload current = tile.getPayload();
+                if(current != null && pay.canPickupPayload(current)){
+                    Call.pickedBuildPayload(unit, tile, false);
+                }
+            }
+        }
+    }
+
+    @Remote(targets = Loc.server, called = Loc.server)
+    public static void pickedUnitPayload(Unit unit, Unit target){
+        if(target != null && unit instanceof Payloadc pay){
+            pay.pickup(target);
+        }else if(target != null){
+            target.remove();
+        }
+    }
+
+    @Remote(targets = Loc.server, called = Loc.server)
+    public static void pickedBuildPayload(Unit unit, Building tile, boolean onGround){
+        if(tile != null && unit instanceof Payloadc pay){
+            if(onGround){
+                if(tile.block.buildVisibility != BuildVisibility.hidden && tile.canPickup() && pay.canPickup(tile)){
+                    pay.pickup(tile);
+                }else{
+                    Fx.unitPickup.at(tile);
+                    tile.tile.remove();
+                }
+            }else{
+                Payload current = tile.getPayload();
+                if(current != null && pay.canPickupPayload(current)){
+                    Payload taken = tile.takePayload();
+                    if(taken != null){
+                        pay.addPayload(taken);
+                        Fx.unitPickup.at(tile);
+                    }
+                }
+            }
+
+        }else if(tile != null && onGround){
+            Fx.unitPickup.at(tile);
+            tile.tile.remove();
+        }
+    }
+
+    @Remote(targets = Loc.both, called = Loc.server)
+    public static void requestDropPayload(Player player, float x, float y){
+        if(player == null || net.client()) return;
+
+        Payloadc pay = (Payloadc)player.unit();
+
+        //apply margin of error
+        Tmp.v1.set(x, y).sub(pay).limit(tilesize * 4f).add(pay);
+        float cx = Tmp.v1.x, cy = Tmp.v1.y;
+
+        Call.payloadDropped(player.unit(), cx, cy);
+    }
+
+    @Remote(called = Loc.server, targets = Loc.server)
+    public static void payloadDropped(Unit unit, float x, float y){
+        if(unit instanceof Payloadc pay){
+            float prevx = pay.x(), prevy = pay.y();
+            pay.set(x, y);
+            pay.dropLastPayload();
+            pay.set(prevx, prevy);
+            pay.controlling().each(u -> {
+                if(u instanceof Payloadc){
+                    Call.payloadDropped(u, u.x, u.y);
+                }
+            });
+        }
+    }
+
+    @Remote(targets = Loc.client, called = Loc.server)
+    public static void dropItem(Player player, float angle){
+        if(player == null) return;
+
+        if(net.server() && player.unit().stack.amount <= 0){
+            throw new ValidateException(player, "Player cannot drop an item.");
+        }
+
+        Fx.dropItem.at(player.x, player.y, angle, Color.white, player.unit().item());
+        player.unit().clearItem();
+    }
+
+    @Remote(targets = Loc.both, called = Loc.server, forward = true, unreliable = true)
+    public static void rotateBlock(@Nullable Player player, Building tile, boolean direction){
+        if(tile == null) return;
+
+        if(net.server() && (!Units.canInteract(player, tile) ||
+            !netServer.admins.allowAction(player, ActionType.rotate, tile.tile(), action -> action.rotation = Mathf.mod(tile.rotation + Mathf.sign(direction), 4)))){
+            throw new ValidateException(player, "Player cannot rotate a block.");
+        }
+
+        if(player != null) tile.lastAccessed = player.name;
+        tile.rotation = Mathf.mod(tile.rotation + Mathf.sign(direction), 4);
+        tile.updateProximity();
+        tile.noSleep();
+    }
+
+    @Remote(targets = Loc.both, called = Loc.both, forward = true)
+    public static void tileConfig(@Nullable Player player, Building tile, @Nullable Object value){
+        if(tile == null) return;
+        if(net.server() && (!Units.canInteract(player, tile) ||
+            !netServer.admins.allowAction(player, ActionType.configure, tile.tile, action -> action.config = value))) throw new ValidateException(player, "Player cannot configure a tile.");
+        tile.configured(player == null || player.dead() ? null : player.unit(), value);
+        Core.app.post(() -> Events.fire(new ConfigEvent(tile, player, value)));
+    }
+
+    //only useful for servers or local mods, and is not replicated across clients
+    //uses unreliable packets due to high frequency
+    @Remote(targets = Loc.both, called = Loc.both, unreliable = true)
+    public static void tileTap(@Nullable Player player, Tile tile){
+        if(tile == null) return;
+
+        Events.fire(new TapEvent(player, tile));
+    }
+
+    @Remote(targets = Loc.both, called = Loc.both, forward = true)
+    public static void unitControl(Player player, @Nullable Unit unit){
+        if(player == null) return;
+
+        //make sure player is allowed to control the unit
+        if(net.server() && !netServer.admins.allowAction(player, ActionType.control, action -> action.unit = unit)){
+            throw new ValidateException(player, "Player cannot control a unit.");
+        }
+
+        //clear player unit when they possess a core
+        if(unit instanceof BlockUnitc block && block.tile() instanceof CoreBuild build){
+            Fx.spawn.at(player);
+            if(net.client()){
+                control.input.controlledType = null;
+            }
+
+            player.clearUnit();
+            player.deathTimer = 61f;
+            build.requestSpawn(player);
+        }else if(unit == null){ //just clear the unit (is this used?)
+            player.clearUnit();
+            //make sure it's AI controlled, so players can't overwrite each other
+        }else if(unit.isAI() && unit.team == player.team() && !unit.dead){
+            if(!net.client()){
+                player.unit(unit);
+            }
+
+            Time.run(Fx.unitSpirit.lifetime, () -> Fx.unitControl.at(unit.x, unit.y, 0f, unit));
+            if(!player.dead()){
+                Fx.unitSpirit.at(player.x, player.y, 0f, unit);
+            }
+        }
+
+        Events.fire(new UnitControlEvent(player, unit));
+    }
+
+    @Remote(targets = Loc.both, called = Loc.both, forward = true)
+    public static void unitClear(Player player){
+        //no free core teleports?
+        if(player == null || !player.dead() && player.unit().spawnedByCore) return;
+
+        Fx.spawn.at(player);
+        player.clearUnit();
+        player.deathTimer = 61f; //for instant respawn
+    }
+
+    @Remote(targets = Loc.both, called = Loc.server, forward = true)
+    public static void unitCommand(Player player){
+        if(player == null || player.dead() || !(player.unit() instanceof Commanderc commander)) return;
+
+        //make sure player is allowed to make the command
+        if(net.server() && !netServer.admins.allowAction(player, ActionType.command, action -> {})){
+            throw new ValidateException(player, "Player cannot command a unit.");
+        }
+
+        if(commander.isCommanding()){
+            commander.clearCommand();
+        }else if(player.unit().type.commandLimit > 0){
+
+            //TODO try out some other formations
+            commander.commandNearby(new CircleFormation());
+            Fx.commandSend.at(player);
+        }
+
+    }
+
+    public Eachable<BuildPlan> allRequests(){
+        return cons -> {
+            for(BuildPlan request : player.unit().plans()) cons.get(request);
+            for(BuildPlan request : selectRequests) cons.get(request);
+            for(BuildPlan request : lineRequests) cons.get(request);
+        };
+    }
+
+    public boolean isUsingSchematic(){
+        return !selectRequests.isEmpty();
+    }
+
+    public OverlayFragment getFrag(){
+        return frag;
+    }
+
+    public void update(){
+        player.typing = ui.chatfrag.shown();
+
+        if(player.isBuilder()){
+            player.unit().updateBuilding(isBuilding);
+        }
+
+        if(player.shooting && !wasShooting && player.unit().hasWeapons() && state.rules.unitAmmo && player.unit().ammo <= 0){
+            player.unit().type.weapons.first().noAmmoSound.at(player.unit());
+        }
+
+        wasShooting = player.shooting;
+
+        if(!player.dead()){
+            controlledType = player.unit().type;
+        }
+
+        if(controlledType != null && player.dead()){
+            Unit unit = Units.closest(player.team(), player.x, player.y, u -> !u.isPlayer() && u.type == controlledType && !u.dead);
+
+            if(unit != null){
+                //only trying controlling once a second to prevent packet spam
+                if(!net.client() || controlInterval.get(0, 70f)){
+                    Call.unitControl(player, unit);
+                }
+            }
+        }
+    }
+
+    public void checkUnit(){
+        if(controlledType != null){
+            Unit unit = Units.closest(player.team(), player.x, player.y, u -> !u.isPlayer() && u.type == controlledType && !u.dead);
+            if(unit == null && controlledType == UnitTypes.block){
+                unit = world.buildWorld(player.x, player.y) instanceof ControlBlock cont && cont.canControl() ? cont.unit() : null;
+            }
+
+            if(unit != null){
+                if(net.client()){
+                    Call.unitControl(player, unit);
+                }else{
+                    unit.controller(player);
+                }
+            }
+        }
+    }
+
+    public void tryPickupPayload(){
+        Unit unit = player.unit();
+        if(!(unit instanceof Payloadc pay)) return;
+
+        Unit target = Units.closest(player.team(), pay.x(), pay.y(), unit.type.hitSize * 2.5f, u -> u.isAI() && u.isGrounded() && pay.canPickup(u) && u.within(unit, u.hitSize + unit.hitSize * 1.2f));
+        if(target != null){
+            Call.requestUnitPayload(player, target);
+        }else{
+            Building tile = world.buildWorld(pay.x(), pay.y());
+
+            if(tile != null && tile.team == unit.team){
+                Call.requestBuildPayload(player, tile);
+            }
+        }
+    }
+
+    public void tryDropPayload(){
+        Unit unit = player.unit();
+        if(!(unit instanceof Payloadc)) return;
+
+        Call.requestDropPayload(player, player.x, player.y);
+    }
+
+    public float getMouseX(){
+        return Core.input.mouseX();
+    }
+
+    public float getMouseY(){
+        return Core.input.mouseY();
+    }
+
+    public void buildPlacementUI(Table table){
+
+    }
+
+    public void buildUI(Group group){
+
+    }
+
+    public void updateState(){
+        if(state.isMenu()){
+            controlledType = null;
+        }
+    }
+
+    public void drawBottom(){
+
+    }
+
+    public void drawTop(){
+
+    }
+
+    public void drawOverSelect(){
+
+    }
+
+    public void drawSelected(int x, int y, Block block, Color color){
+        Drawf.selected(x, y, block, color);
+    }
+
+    public void drawBreaking(BuildPlan request){
+        if(request.breaking){
+            drawBreaking(request.x, request.y);
+        }else{
+            drawSelected(request.x, request.y, request.block, Pal.remove);
+        }
+    }
+
+    public boolean requestMatches(BuildPlan request){
+        Tile tile = world.tile(request.x, request.y);
+        return tile != null && tile.block() instanceof ConstructBlock && tile.<ConstructBuild>bc().cblock == request.block;
+    }
+
+    public void drawBreaking(int x, int y){
+        Tile tile = world.tile(x, y);
+        if(tile == null) return;
+        Block block = tile.block();
+
+        drawSelected(x, y, block, Pal.remove);
+    }
+
+    public void useSchematic(Schematic schem){
+        selectRequests.addAll(schematics.toRequests(schem, player.tileX(), player.tileY()));
+    }
+
+    protected void showSchematicSave(){
+        if(lastSchematic == null) return;
+
+        ui.showTextInput("@schematic.add", "@name", "", text -> {
+            Schematic replacement = schematics.all().find(s -> s.name().equals(text));
+            if(replacement != null){
+                ui.showConfirm("@confirm", "@schematic.replace", () -> {
+                    schematics.overwrite(replacement, lastSchematic);
+                    ui.showInfoFade("@schematic.saved");
+                    ui.schematics.showInfo(replacement);
+                });
+            }else{
+                lastSchematic.tags.put("name", text);
+                lastSchematic.tags.put("description", "");
+                schematics.add(lastSchematic);
+                ui.showInfoFade("@schematic.saved");
+                ui.schematics.showInfo(lastSchematic);
+                Events.fire(new SchematicCreateEvent(lastSchematic));
+            }
+        });
+    }
+
+    public void rotateRequests(Seq<BuildPlan> requests, int direction){
+        int ox = schemOriginX(), oy = schemOriginY();
+
+        requests.each(req -> {
+            req.pointConfig(p -> {
+                int cx = p.x, cy = p.y;
+                int lx = cx;
+
+                if(direction >= 0){
+                    cx = -cy;
+                    cy = lx;
+                }else{
+                    cx = cy;
+                    cy = -lx;
+                }
+                p.set(cx, cy);
+            });
+
+            //rotate actual request, centered on its multiblock position
+            float wx = (req.x - ox) * tilesize + req.block.offset, wy = (req.y - oy) * tilesize + req.block.offset;
+            float x = wx;
+            if(direction >= 0){
+                wx = -wy;
+                wy = x;
+            }else{
+                wx = wy;
+                wy = -x;
+            }
+            req.x = World.toTile(wx - req.block.offset) + ox;
+            req.y = World.toTile(wy - req.block.offset) + oy;
+            req.rotation = Mathf.mod(req.rotation + direction, 4);
+        });
+    }
+
+    public void flipRequests(Seq<BuildPlan> requests, boolean x){
+        int origin = (x ? schemOriginX() : schemOriginY()) * tilesize;
+
+        requests.each(req -> {
+            float value = -((x ? req.x : req.y) * tilesize - origin + req.block.offset) + origin;
+
+            if(x){
+                req.x = (int)((value - req.block.offset) / tilesize);
+            }else{
+                req.y = (int)((value - req.block.offset) / tilesize);
+            }
+
+            req.pointConfig(p -> {
+                int corigin = x ? req.originalWidth/2 : req.originalHeight/2;
+                int nvalue = -(x ? p.x : p.y);
+                if(x){
+                    req.originalX = -(req.originalX - corigin) + corigin;
+                    p.x = nvalue;
+                }else{
+                    req.originalY = -(req.originalY - corigin) + corigin;
+                    p.y = nvalue;
+                }
+            });
+
+            //flip rotation
+            if(x == (req.rotation % 2 == 0)){
+                req.rotation = Mathf.mod(req.rotation + 2, 4);
+            }
+        });
+    }
+
+    protected int schemOriginX(){
+        return rawTileX();
+    }
+
+    protected int schemOriginY(){
+        return rawTileY();
+    }
+
+    /** Returns the selection request that overlaps this position, or null. */
+    protected BuildPlan getRequest(int x, int y){
+        return getRequest(x, y, 1, null);
+    }
+
+    /** Returns the selection request that overlaps this position, or null. */
+    protected BuildPlan getRequest(int x, int y, int size, BuildPlan skip){
+        float offset = ((size + 1) % 2) * tilesize / 2f;
+        r2.setSize(tilesize * size);
+        r2.setCenter(x * tilesize + offset, y * tilesize + offset);
+        resultreq = null;
+
+        Boolf<BuildPlan> test = req -> {
+            if(req == skip) return false;
+            Tile other = req.tile();
+
+            if(other == null) return false;
+
+            if(!req.breaking){
+                r1.setSize(req.block.size * tilesize);
+                r1.setCenter(other.worldx() + req.block.offset, other.worldy() + req.block.offset);
+            }else{
+                r1.setSize(other.block().size * tilesize);
+                r1.setCenter(other.worldx() + other.block().offset, other.worldy() + other.block().offset);
+            }
+
+            return r2.overlaps(r1);
+        };
+
+        for(BuildPlan req : player.unit().plans()){
+            if(test.get(req)) return req;
+        }
+
+        return selectRequests.find(test);
+    }
+
+    protected void drawBreakSelection(int x1, int y1, int x2, int y2, int maxLength){
+        NormalizeDrawResult result = Placement.normalizeDrawArea(Blocks.air, x1, y1, x2, y2, false, maxLength, 1f);
+        NormalizeResult dresult = Placement.normalizeArea(x1, y1, x2, y2, rotation, false, maxLength);
+
+        for(int x = dresult.x; x <= dresult.x2; x++){
+            for(int y = dresult.y; y <= dresult.y2; y++){
+                Tile tile = world.tileBuilding(x, y);
+                if(tile == null || !validBreak(tile.x, tile.y)) continue;
+
+                drawBreaking(tile.x, tile.y);
+            }
+        }
+
+        Tmp.r1.set(result.x, result.y, result.x2 - result.x, result.y2 - result.y);
+
+        Draw.color(Pal.remove);
+        Lines.stroke(1f);
+
+        for(BuildPlan req : player.unit().plans()){
+            if(req.breaking) continue;
+            if(req.bounds(Tmp.r2).overlaps(Tmp.r1)){
+                drawBreaking(req);
+            }
+        }
+
+        for(BuildPlan req : selectRequests){
+            if(req.breaking) continue;
+            if(req.bounds(Tmp.r2).overlaps(Tmp.r1)){
+                drawBreaking(req);
+            }
+        }
+
+        for(BlockPlan req : player.team().data().blocks){
+            Block block = content.block(req.block);
+            if(block.bounds(req.x, req.y, Tmp.r2).overlaps(Tmp.r1)){
+                drawSelected(req.x, req.y, content.block(req.block), Pal.remove);
+            }
+        }
+
+        Lines.stroke(2f);
+
+        Draw.color(Pal.removeBack);
+        Lines.rect(result.x, result.y - 1, result.x2 - result.x, result.y2 - result.y);
+        Draw.color(Pal.remove);
+        Lines.rect(result.x, result.y, result.x2 - result.x, result.y2 - result.y);
+    }
+
+    protected void drawBreakSelection(int x1, int y1, int x2, int y2){
+        drawBreakSelection(x1, y1, x2, y2, maxLength);
+    }
+
+    protected void drawSelection(int x1, int y1, int x2, int y2, int maxLength){
+        NormalizeDrawResult result = Placement.normalizeDrawArea(Blocks.air, x1, y1, x2, y2, false, maxLength, 1f);
+
+        Lines.stroke(2f);
+
+        Draw.color(Pal.accentBack);
+        Lines.rect(result.x, result.y - 1, result.x2 - result.x, result.y2 - result.y);
+        Draw.color(Pal.accent);
+        Lines.rect(result.x, result.y, result.x2 - result.x, result.y2 - result.y);
+    }
+
+    protected void flushSelectRequests(Seq<BuildPlan> requests){
+        for(BuildPlan req : requests){
+            if(req.block != null && validPlace(req.x, req.y, req.block, req.rotation)){
+                BuildPlan other = getRequest(req.x, req.y, req.block.size, null);
+                if(other == null){
+                    selectRequests.add(req.copy());
+                }else if(!other.breaking && other.x == req.x && other.y == req.y && other.block.size == req.block.size){
+                    selectRequests.remove(other);
+                    selectRequests.add(req.copy());
+                }
+            }
+        }
+    }
+
+    protected void flushRequests(Seq<BuildPlan> requests){
+        for(BuildPlan req : requests){
+            if(req.block != null && validPlace(req.x, req.y, req.block, req.rotation)){
+                BuildPlan copy = req.copy();
+                player.unit().addBuild(copy);
+            }
+        }
+    }
+
+    protected void drawOverRequest(BuildPlan request){
+        boolean valid = validPlace(request.x, request.y, request.block, request.rotation);
+
+        Draw.reset();
+        Draw.mixcol(!valid ? Pal.breakInvalid : Color.white, (!valid ? 0.4f : 0.24f) + Mathf.absin(Time.globalTime, 6f, 0.28f));
+        Draw.alpha(1f);
+        request.block.drawRequestConfigTop(request, selectRequests);
+        Draw.reset();
+    }
+
+    protected void drawRequest(BuildPlan request){
+        request.block.drawRequest(request, allRequests(), validPlace(request.x, request.y, request.block, request.rotation));
+    }
+
+    /** Draws a placement icon for a specific block. */
+    protected void drawRequest(int x, int y, Block block, int rotation){
+        brequest.set(x, y, rotation, block);
+        brequest.animScale = 1f;
+        block.drawRequest(brequest, allRequests(), validPlace(x, y, block, rotation));
+    }
+
+    /** Remove everything from the queue in a selection. */
+    protected void removeSelection(int x1, int y1, int x2, int y2){
+        removeSelection(x1, y1, x2, y2, false);
+    }
+
+    /** Remove everything from the queue in a selection. */
+    protected void removeSelection(int x1, int y1, int x2, int y2, int maxLength){
+        removeSelection(x1, y1, x2, y2, false, maxLength);
+    }
+
+    /** Remove everything from the queue in a selection. */
+    protected void removeSelection(int x1, int y1, int x2, int y2, boolean flush){
+        removeSelection(x1, y1, x2, y2, flush, maxLength);
+    }
+
+    /** Remove everything from the queue in a selection. */
+    protected void removeSelection(int x1, int y1, int x2, int y2, boolean flush, int maxLength){
+        NormalizeResult result = Placement.normalizeArea(x1, y1, x2, y2, rotation, false, maxLength);
+        for(int x = 0; x <= Math.abs(result.x2 - result.x); x++){
+            for(int y = 0; y <= Math.abs(result.y2 - result.y); y++){
+                int wx = x1 + x * Mathf.sign(x2 - x1);
+                int wy = y1 + y * Mathf.sign(y2 - y1);
+
+                Tile tile = world.tileBuilding(wx, wy);
+
+                if(tile == null) continue;
+
+                if(!flush){
+                    tryBreakBlock(wx, wy);
+                }else if(validBreak(tile.x, tile.y) && !selectRequests.contains(r -> r.tile() != null && r.tile() == tile)){
+                    selectRequests.add(new BuildPlan(tile.x, tile.y));
+                }
+            }
+        }
+
+        //remove build requests
+        Tmp.r1.set(result.x * tilesize, result.y * tilesize, (result.x2 - result.x) * tilesize, (result.y2 - result.y) * tilesize);
+
+        Iterator<BuildPlan> it = player.unit().plans().iterator();
+        while(it.hasNext()){
+            BuildPlan req = it.next();
+            if(!req.breaking && req.bounds(Tmp.r2).overlaps(Tmp.r1)){
+                it.remove();
+            }
+        }
+
+        it = selectRequests.iterator();
+        while(it.hasNext()){
+            BuildPlan req = it.next();
+            if(!req.breaking && req.bounds(Tmp.r2).overlaps(Tmp.r1)){
+                it.remove();
+            }
+        }
+
+        //remove blocks to rebuild
+        Iterator<BlockPlan> broken = state.teams.get(player.team()).blocks.iterator();
+        while(broken.hasNext()){
+            BlockPlan req = broken.next();
+            Block block = content.block(req.block);
+            if(block.bounds(req.x, req.y, Tmp.r2).overlaps(Tmp.r1)){
+                broken.remove();
+            }
+        }
+    }
+
+    protected void updateLine(int x1, int y1, int x2, int y2){
+        lineRequests.clear();
+        iterateLine(x1, y1, x2, y2, l -> {
+            rotation = l.rotation;
+            BuildPlan req = new BuildPlan(l.x, l.y, l.rotation, block, block.nextConfig());
+            req.animScale = 1f;
+            lineRequests.add(req);
+        });
+
+        if(Core.settings.getBool("blockreplace")){
+            lineRequests.each(req -> {
+                Block replace = req.block.getReplacement(req, lineRequests);
+                if(replace.unlockedNow()){
+                    req.block = replace;
+                }
+            });
+        }
+    }
+
+    protected void updateLine(int x1, int y1){
+        updateLine(x1, y1, tileX(getMouseX()), tileY(getMouseY()));
+    }
+
+    /** Handles tile tap events that are not platform specific. */
+    boolean tileTapped(@Nullable Building tile){
+        if(tile == null){
+            frag.inv.hide();
+            frag.config.hideConfig();
+            return false;
+        }
+        boolean consumed = false, showedInventory = false;
+
+        //check if tapped block is configurable
+        if(tile.block.configurable && tile.interactable(player.team())){
+            consumed = true;
+            if(((!frag.config.isShown() && tile.shouldShowConfigure(player)) //if the config fragment is hidden, show
+            //alternatively, the current selected block can 'agree' to switch config tiles
+            || (frag.config.isShown() && frag.config.getSelectedTile().onConfigureTileTapped(tile)))){
+                Sounds.click.at(tile);
+                frag.config.showConfig(tile);
+            }
+            //otherwise...
+        }else if(!frag.config.hasConfigMouse()){ //make sure a configuration fragment isn't on the cursor
+            //then, if it's shown and the current block 'agrees' to hide, hide it.
+            if(frag.config.isShown() && frag.config.getSelectedTile().onConfigureTileTapped(tile)){
+                consumed = true;
+                frag.config.hideConfig();
+            }
+
+            if(frag.config.isShown()){
+                consumed = true;
+            }
+        }
+
+        //call tapped event
+        if(!consumed && tile.interactable(player.team())){
+            tile.tapped();
+        }
+
+        //consume tap event if necessary
+        if(tile.interactable(player.team()) && tile.block.consumesTap){
+            consumed = true;
+        }else if(tile.interactable(player.team()) && tile.block.synthetic() && !consumed){
+            if(tile.block.hasItems && tile.items.total() > 0){
+                frag.inv.showFor(tile);
+                consumed = true;
+                showedInventory = true;
+            }
+        }
+
+        if(!showedInventory){
+            frag.inv.hide();
+        }
+
+        return consumed;
+    }
+
+    /** Tries to select the player to drop off items, returns true if successful. */
+    boolean tryTapPlayer(float x, float y){
+        if(canTapPlayer(x, y)){
+            droppingItem = true;
+            return true;
+        }
         return false;
-      }
-      int count;
-      do {
-        count = refCount.get();
-        if (count == 0) {
-          return false;
-        }
-      } while (!refCount.compareAndSet(count, count + 1));
-      return true;
     }
 
-    private void releaseCluster(final String cluster) {
-      int count = clusterRefs.get(cluster).decrementAndGet();
-      if (count == 0) {
-        syncContext.execute(new Runnable() {
-          @Override
-          public void run() {
-            if (clusterRefs.get(cluster).get() == 0) {
-              clusterRefs.remove(cluster);
-              updateResolutionResult();
+    boolean canTapPlayer(float x, float y){
+        return player.within(x, y, playerSelectRange) && player.unit().stack.amount > 0;
+    }
+
+    /** Tries to begin mining a tile, returns true if successful. */
+    boolean tryBeginMine(Tile tile){
+        if(canMine(tile)){
+            //if a block is clicked twice, reset it
+            player.unit().mineTile = player.unit().mineTile == tile ? null : tile;
+            return true;
+        }
+        return false;
+    }
+
+    boolean canMine(Tile tile){
+        return !Core.scene.hasMouse()
+            && tile.drop() != null
+            && player.unit().validMine(tile)
+            && !(tile.floor().playerUnmineable && tile.overlay().itemDrop == null)
+            && player.unit().acceptsItem(tile.drop())
+            && tile.block() == Blocks.air;
+    }
+
+    /** Returns the tile at the specified MOUSE coordinates. */
+    Tile tileAt(float x, float y){
+        return world.tile(tileX(x), tileY(y));
+    }
+
+    int rawTileX(){
+        return World.toTile(Core.input.mouseWorld().x);
+    }
+
+    int rawTileY(){
+        return World.toTile(Core.input.mouseWorld().y);
+    }
+
+    int tileX(float cursorX){
+        Vec2 vec = Core.input.mouseWorld(cursorX, 0);
+        if(selectedBlock()){
+            vec.sub(block.offset, block.offset);
+        }
+        return World.toTile(vec.x);
+    }
+
+    int tileY(float cursorY){
+        Vec2 vec = Core.input.mouseWorld(0, cursorY);
+        if(selectedBlock()){
+            vec.sub(block.offset, block.offset);
+        }
+        return World.toTile(vec.y);
+    }
+
+    public boolean selectedBlock(){
+        return isPlacing();
+    }
+
+    public boolean isPlacing(){
+        return block != null;
+    }
+
+    public boolean isBreaking(){
+        return false;
+    }
+
+    public float mouseAngle(float x, float y){
+        return Core.input.mouseWorld(getMouseX(), getMouseY()).sub(x, y).angle();
+    }
+
+    public @Nullable Unit selectedUnit(){
+        Unit unit = Units.closest(player.team(), Core.input.mouseWorld().x, Core.input.mouseWorld().y, 40f, Unitc::isAI);
+        if(unit != null){
+            unit.hitbox(Tmp.r1);
+            Tmp.r1.grow(6f);
+            if(Tmp.r1.contains(Core.input.mouseWorld())){
+                return unit;
             }
-          }
-        });
-      }
-    }
-  }
-
-  private class ResolveState implements LdsResourceWatcher {
-    private final ConfigOrError emptyServiceConfig =
-        serviceConfigParser.parseServiceConfig(Collections.<String, Object>emptyMap());
-    private final ResolutionResult emptyResult =
-        ResolutionResult.newBuilder()
-            .setServiceConfig(emptyServiceConfig)
-            // let channel take action for no config selector
-            .build();
-    private boolean stopped;
-    private Set<String> existingClusters;
-    @Nullable
-    private String rdsResource;
-    @Nullable
-    private RdsResourceWatcher rdsWatcher;
-    private long httpMaxStreamDurationNano;
-
-    @Override
-    public void onChanged(final LdsUpdate update) {
-      syncContext.execute(new Runnable() {
-        @Override
-        public void run() {
-          if (stopped) {
-            return;
-          }
-          logger.log(XdsLogLevel.INFO, "Receive LDS resource update: {0}", update);
-          httpMaxStreamDurationNano = update.httpMaxStreamDurationNano;
-          List<VirtualHost> virtualHosts = update.virtualHosts;
-          String rdsName = update.rdsName;
-          if (rdsName != null && rdsName.equals(rdsResource)) {
-            return;
-          }
-          cleanUpRdsWatcher();
-          if (virtualHosts != null) {
-            updateRoutes(virtualHosts);
-          } else {
-            rdsResource = rdsName;
-            rdsWatcher = new RdsResourceWatcherImpl();
-            logger.log(XdsLogLevel.INFO, "Start watching RDS resource {0}", rdsResource);
-            xdsClient.watchRdsResource(rdsResource, rdsWatcher);
-          }
         }
-      });
-    }
 
-    @Override
-    public void onError(final Status error) {
-      syncContext.execute(new Runnable() {
-        @Override
-        public void run() {
-          if (stopped) {
-            return;
-          }
-          logger.log(
-              XdsLogLevel.WARNING,
-              "Received error from xDS client {0}: {1}", xdsClient, error.getDescription());
-          listener.onError(error);
+        Building tile = world.buildWorld(Core.input.mouseWorld().x, Core.input.mouseWorld().y);
+        if(tile instanceof ControlBlock cont && cont.canControl() && tile.team == player.team()){
+            return cont.unit();
         }
-      });
+
+        return null;
     }
 
-    @Override
-    public void onResourceDoesNotExist(final String resourceName) {
-      syncContext.execute(new Runnable() {
-        @Override
-        public void run() {
-          if (stopped) {
-            return;
-          }
-          logger.log(XdsLogLevel.INFO, "LDS resource {0} unavailable", resourceName);
-          cleanUpRdsWatcher();
-          listener.onResult(emptyResult);
-        }
-      });
-    }
-
-    private void start() {
-      logger.log(XdsLogLevel.INFO, "Start watching LDS resource {0}", authority);
-      xdsClient.watchLdsResource(authority, this);
-    }
-
-    private void stop() {
-      logger.log(XdsLogLevel.INFO, "Stop watching LDS resource {0}", authority);
-      stopped = true;
-      cleanUpRdsWatcher();
-      xdsClient.cancelLdsResourceWatch(authority, this);
-    }
-
-    private void updateRoutes(List<VirtualHost> virtualHosts) {
-      VirtualHost virtualHost = findVirtualHostForHostName(virtualHosts, authority);
-      if (virtualHost == null) {
-        logger.log(XdsLogLevel.WARNING,
-            "Failed to find virtual host matching hostname {0}", authority);
-        listener.onResult(emptyResult);
-        return;
-      }
-      List<Route> routes = virtualHost.getRoutes();
-      Set<String> clusters = new HashSet<>();
-      for (Route route : routes) {
-        RouteAction action = route.getRouteAction();
-        if (action.getCluster() != null) {
-          clusters.add(action.getCluster());
-        } else if (action.getWeightedCluster() != null) {
-          for (ClusterWeight weighedCluster : action.getWeightedCluster()) {
-            clusters.add(weighedCluster.getName());
-          }
-        }
-      }
-      Set<String> addedClusters =
-          existingClusters == null ? clusters : Sets.difference(clusters, existingClusters);
-      Set<String> deletedClusters =
-          existingClusters == null
-              ? Collections.<String>emptySet() : Sets.difference(existingClusters, clusters);
-      existingClusters = clusters;
-      boolean shouldUpdateResult = false;
-      for (String cluster : addedClusters) {
-        if (clusterRefs.containsKey(cluster)) {
-          clusterRefs.get(cluster).incrementAndGet();
-        } else {
-          clusterRefs.put(cluster, new AtomicInteger(1));
-          shouldUpdateResult = true;
-        }
-      }
-      // Update service config to include newly added clusters.
-      if (shouldUpdateResult) {
-        updateResolutionResult();
-      }
-      // Make newly added clusters selectable by config selector and deleted clusters no longer
-      // selectable.
-      routingConfig = new RoutingConfig(httpMaxStreamDurationNano, routes);
-      shouldUpdateResult = false;
-      for (String cluster : deletedClusters) {
-        int count = clusterRefs.get(cluster).decrementAndGet();
-        if (count == 0) {
-          clusterRefs.remove(cluster);
-          shouldUpdateResult = true;
-        }
-      }
-      if (shouldUpdateResult) {
-        updateResolutionResult();
-      }
-    }
-
-    private void cleanUpRdsWatcher() {
-      if (rdsWatcher != null) {
-        logger.log(XdsLogLevel.INFO, "Stop watching RDS resource {0}", rdsResource);
-        xdsClient.cancelRdsResourceWatch(rdsResource, rdsWatcher);
-        rdsResource = null;
-        rdsWatcher = null;
-      }
-    }
-
-    private class RdsResourceWatcherImpl implements RdsResourceWatcher {
-
-      @Override
-      public void onChanged(final RdsUpdate update) {
-        syncContext.execute(new Runnable() {
-          @Override
-          public void run() {
-            if (RdsResourceWatcherImpl.this != rdsWatcher) {
-              return;
+    public void remove(){
+        Core.input.removeProcessor(this);
+        frag.remove();
+        if(Core.scene != null){
+            Table table = (Table)Core.scene.find("inputTable");
+            if(table != null){
+                table.clear();
             }
-            updateRoutes(update.virtualHosts);
-          }
-        });
-      }
-
-      @Override
-      public void onError(final Status error) {
-        syncContext.execute(new Runnable() {
-          @Override
-          public void run() {
-            if (RdsResourceWatcherImpl.this != rdsWatcher) {
-              return;
-            }
-            logger.log(
-                XdsLogLevel.WARNING,
-                "Received error from xDS client {0}: {1}", xdsClient, error.getDescription());
-            listener.onError(error);
-          }
-        });
-      }
-
-      @Override
-      public void onResourceDoesNotExist(final String resourceName) {
-        syncContext.execute(new Runnable() {
-          @Override
-          public void run() {
-            if (RdsResourceWatcherImpl.this != rdsWatcher) {
-              return;
-            }
-            logger.log(XdsLogLevel.INFO, "RDS resource {0} unavailable", resourceName);
-            listener.onResult(emptyResult);
-          }
-        });
-      }
+        }
+        if(detector != null){
+            Core.input.removeProcessor(detector);
+        }
+        if(uiGroup != null){
+            uiGroup.remove();
+            uiGroup = null;
+        }
     }
-  }
 
-  /**
-   * Grouping of the list of usable routes and their corresponding fallback timeout value.
-   */
-  private static class RoutingConfig {
-    private long fallbackTimeoutNano;
-    private List<Route> routes;
+    public void add(){
+        Core.input.getInputProcessors().remove(i -> i instanceof InputHandler || (i instanceof GestureDetector && ((GestureDetector)i).getListener() instanceof InputHandler));
+        Core.input.addProcessor(detector = new GestureDetector(20, 0.5f, 0.3f, 0.15f, this));
+        Core.input.addProcessor(this);
+        if(Core.scene != null){
+            Table table = (Table)Core.scene.find("inputTable");
+            if(table != null){
+                table.clear();
+                buildPlacementUI(table);
+            }
 
-    private static RoutingConfig empty = new RoutingConfig(0L, Collections.<Route>emptyList());
+            uiGroup = new WidgetGroup();
+            uiGroup.touchable = Touchable.childrenOnly;
+            uiGroup.setFillParent(true);
+            ui.hudGroup.addChild(uiGroup);
+            uiGroup.toBack();
+            buildUI(uiGroup);
 
-    private RoutingConfig(long fallbackTimeoutNano, List<Route> routes) {
-      this.fallbackTimeoutNano = fallbackTimeoutNano;
-      this.routes = routes;
+            frag.add();
+        }
     }
-  }
+
+    public boolean canShoot(){
+        return block == null && !onConfigurable() && !isDroppingItem() && !player.unit().activelyBuilding() &&
+            !(player.unit() instanceof Mechc && player.unit().isFlying());
+    }
+
+    public boolean onConfigurable(){
+        return false;
+    }
+
+    public boolean isDroppingItem(){
+        return droppingItem;
+    }
+
+    public boolean canDropItem(){
+        return droppingItem && !canTapPlayer(Core.input.mouseWorldX(), Core.input.mouseWorldY());
+    }
+
+    public void tryDropItems(@Nullable Building tile, float x, float y){
+        if(!droppingItem || player.unit().stack.amount <= 0 || canTapPlayer(x, y) || state.isPaused() ){
+            droppingItem = false;
+            return;
+        }
+
+        droppingItem = false;
+
+        ItemStack stack = player.unit().stack;
+
+        if(tile != null && tile.acceptStack(stack.item, stack.amount, player.unit()) > 0 && tile.interactable(player.team()) && tile.block.hasItems && player.unit().stack().amount > 0 && tile.interactable(player.team())){
+            Call.transferInventory(player, tile);
+        }else{
+            Call.dropItem(player.angleTo(x, y));
+        }
+    }
+
+    public void tryPlaceBlock(int x, int y){
+        if(block != null && validPlace(x, y, block, rotation)){
+            placeBlock(x, y, block, rotation);
+        }
+    }
+
+    public void tryBreakBlock(int x, int y){
+        if(validBreak(x, y)){
+            breakBlock(x, y);
+        }
+    }
+
+    public boolean validPlace(int x, int y, Block type, int rotation){
+        return validPlace(x, y, type, rotation, null);
+    }
+
+    public boolean validPlace(int x, int y, Block type, int rotation, BuildPlan ignore){
+        for(BuildPlan req : player.unit().plans()){
+            if(req != ignore
+                    && !req.breaking
+                    && req.block.bounds(req.x, req.y, Tmp.r1).overlaps(type.bounds(x, y, Tmp.r2))
+                    && !(type.canReplace(req.block) && Tmp.r1.equals(Tmp.r2))){
+                return false;
+            }
+        }
+        return Build.validPlace(type, player.team(), x, y, rotation);
+    }
+
+    public boolean validBreak(int x, int y){
+        return Build.validBreak(player.team(), x, y);
+    }
+
+    public void placeBlock(int x, int y, Block block, int rotation){
+        BuildPlan req = getRequest(x, y);
+        if(req != null){
+            player.unit().plans().remove(req);
+        }
+        player.unit().addBuild(new BuildPlan(x, y, rotation, block, block.nextConfig()));
+    }
+
+    public void breakBlock(int x, int y){
+        Tile tile = world.tile(x, y);
+        if(tile != null && tile.build != null) tile = tile.build.tile;
+        player.unit().addBuild(new BuildPlan(tile.x, tile.y));
+    }
+
+    public void drawArrow(Block block, int x, int y, int rotation){
+        drawArrow(block, x, y, rotation, validPlace(x, y, block, rotation));
+    }
+
+    public void drawArrow(Block block, int x, int y, int rotation, boolean valid){
+        float trns = (block.size / 2) * tilesize;
+        int dx = Geometry.d4(rotation).x, dy = Geometry.d4(rotation).y;
+
+        Draw.color(!valid ? Pal.removeBack : Pal.accentBack);
+        Draw.rect(Core.atlas.find("place-arrow"),
+        x * tilesize + block.offset + dx*trns,
+        y * tilesize + block.offset - 1 + dy*trns,
+        Core.atlas.find("place-arrow").width * Draw.scl,
+        Core.atlas.find("place-arrow").height * Draw.scl, rotation * 90 - 90);
+
+        Draw.color(!valid ? Pal.remove : Pal.accent);
+        Draw.rect(Core.atlas.find("place-arrow"),
+        x * tilesize + block.offset + dx*trns,
+        y * tilesize + block.offset + dy*trns,
+        Core.atlas.find("place-arrow").width * Draw.scl,
+        Core.atlas.find("place-arrow").height * Draw.scl, rotation * 90 - 90);
+    }
+
+    void iterateLine(int startX, int startY, int endX, int endY, Cons<PlaceLine> cons){
+        Seq<Point2> points;
+        boolean diagonal = Core.input.keyDown(Binding.diagonal_placement);
+
+        if(Core.settings.getBool("swapdiagonal") && mobile){
+            diagonal = !diagonal;
+        }
+
+        if(block instanceof PowerNode){
+            diagonal = !diagonal;
+        }
+
+        if(diagonal){
+            points = Placement.pathfindLine(block != null && block.conveyorPlacement, startX, startY, endX, endY);
+        }else{
+            points = Placement.normalizeLine(startX, startY, endX, endY);
+        }
+
+        if(block instanceof PowerNode node){
+            var base = tmpPoints2;
+            var result = tmpPoints.clear();
+
+            base.selectFrom(points, p -> p == points.first() || p == points.peek() || Build.validPlace(block, player.team(), p.x, p.y, rotation, false));
+            boolean addedLast = false;
+
+            outer:
+            for(int i = 0; i < base.size;){
+                var point = base.get(i);
+                result.add(point);
+                if(i == base.size - 1) addedLast = true;
+
+                //find the furthest node that overlaps this one
+                for(int j = base.size - 1; j > i; j--){
+                    var other = base.get(j);
+                    boolean over = node.overlaps(world.tile(point.x, point.y), world.tile(other.x, other.y));
+
+                    if(over){
+                        //add node to list and start searching for node that overlaps the next one
+                        i = j;
+                        continue outer;
+                    }
+                }
+
+                //if it got here, that means nothing was found. try to proceed to the next node anyway
+                i ++;
+            }
+
+            if(!addedLast) result.add(base.peek());
+
+            points.clear();
+            points.addAll(result);
+        }
+
+        float angle = Angles.angle(startX, startY, endX, endY);
+        int baseRotation = rotation;
+        if(!overrideLineRotation || diagonal){
+            baseRotation = (startX == endX && startY == endY) ? rotation : ((int)((angle + 45) / 90f)) % 4;
+        }
+
+        Tmp.r3.set(-1, -1, 0, 0);
+
+        for(int i = 0; i < points.size; i++){
+            Point2 point = points.get(i);
+
+            if(block != null && Tmp.r2.setSize(block.size * tilesize).setCenter(point.x * tilesize + block.offset, point.y * tilesize + block.offset).overlaps(Tmp.r3)){
+                continue;
+            }
+
+            Point2 next = i == points.size - 1 ? null : points.get(i + 1);
+            line.x = point.x;
+            line.y = point.y;
+            if(!overrideLineRotation || diagonal){
+                if(next != null){
+                    line.rotation = Tile.relativeTo(point.x, point.y, next.x, next.y);
+                }else if(block.conveyorPlacement && i > 0){
+                    Point2 prev = points.get(i - 1);
+                    line.rotation = Tile.relativeTo(prev.x, prev.y, point.x, point.y);
+                }else{
+                    line.rotation = baseRotation;
+                }
+            }else{
+                line.rotation = rotation;
+            }
+            line.last = next == null;
+            cons.get(line);
+
+            Tmp.r3.setSize(block.size * tilesize).setCenter(point.x * tilesize + block.offset, point.y * tilesize + block.offset);
+        }
+    }
+
+    static class PlaceLine{
+        public int x, y, rotation;
+        public boolean last;
+    }
 }
