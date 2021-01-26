@@ -1,457 +1,786 @@
 /*
- * Copyright 2019 The gRPC Authors
+ * Copyright 2018 Confluent Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed under the Confluent Community License (the "License"); you may not use
+ * this file except in compliance with the License.  You may obtain a copy of the
+ * License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.confluent.io/confluent-community-license
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OF ANY KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations under the License.
  */
 
-package io.grpc.xds.internal.sds;
+package io.confluent.connect.jdbc.sink;
 
-import static com.google.common.base.Preconditions.checkNotNull;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.sink.SinkRecord;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
+import org.mockito.Matchers;
+import org.mockito.Mockito;
 
-import com.google.common.annotations.VisibleForTesting;
-import io.grpc.Attributes;
-import io.grpc.internal.GrpcUtil;
-import io.grpc.internal.ObjectPool;
-import io.grpc.netty.GrpcHttp2ConnectionHandler;
-import io.grpc.netty.InternalNettyChannelBuilder;
-import io.grpc.netty.InternalNettyChannelBuilder.ProtocolNegotiatorFactory;
-import io.grpc.netty.InternalProtocolNegotiationEvent;
-import io.grpc.netty.InternalProtocolNegotiator;
-import io.grpc.netty.InternalProtocolNegotiator.ProtocolNegotiator;
-import io.grpc.netty.InternalProtocolNegotiators;
-import io.grpc.netty.NettyChannelBuilder;
-import io.grpc.netty.ProtocolNegotiationEvent;
-import io.grpc.xds.EnvoyServerProtoData.DownstreamTlsContext;
-import io.grpc.xds.InternalXdsAttributes;
-import io.grpc.xds.XdsClientWrapperForServerSds;
-import io.netty.channel.ChannelHandler;
-import io.netty.channel.ChannelHandlerAdapter;
-import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelInboundHandlerAdapter;
-import io.netty.handler.ssl.SslContext;
-import io.netty.util.AsciiString;
-import java.security.cert.CertStoreException;
-import java.util.ArrayList;
+import java.io.IOException;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
-import java.util.concurrent.Executor;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-import javax.annotation.Nullable;
+import java.util.Map;
+import java.util.Random;
 
-/**
- * Provides client and server side gRPC {@link ProtocolNegotiator}s that use SDS to provide the SSL
- * context.
- */
-@VisibleForTesting
-public final class SdsProtocolNegotiators {
+import io.confluent.connect.jdbc.dialect.DatabaseDialect;
+import io.confluent.connect.jdbc.dialect.DatabaseDialects;
+import io.confluent.connect.jdbc.dialect.SqliteDatabaseDialect;
+import io.confluent.connect.jdbc.sink.metadata.FieldsMetadata;
+import io.confluent.connect.jdbc.util.TableId;
 
-  // Prevent instantiation.
-  private SdsProtocolNegotiators() {
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+public class BufferedRecordsTest {
+
+  private final SqliteHelper sqliteHelper = new SqliteHelper(getClass().getSimpleName());
+
+  private Map<Object, Object> props;
+
+  @Before
+  public void setUp() throws IOException, SQLException {
+    sqliteHelper.setUp();
+    props = new HashMap<>();
+    props.put("name", "my-connector");
+    props.put("connection.url", sqliteHelper.sqliteUri());
+    props.put("batch.size", 1000); // sufficiently high to not cause flushes due to buffer being full
+    // We don't manually create the table, so let the connector do it
+    props.put("auto.create", true);
+    // We use various schemas, so let the connector add missing columns
+    props.put("auto.evolve", true);
   }
 
-  private static final Logger logger = Logger.getLogger(SdsProtocolNegotiators.class.getName());
-
-  public static final Attributes.Key<XdsClientWrapperForServerSds> SERVER_XDS_CLIENT
-      = Attributes.Key.create("serverXdsClient");
-  private static final AsciiString SCHEME = AsciiString.of("http");
-
-  /**
-   * Returns a {@link ProtocolNegotiatorFactory} to be used on {@link NettyChannelBuilder}.
-   *
-   * @param fallbackNegotiator protocol negotiator to use as fallback.
-   */
-  public static ProtocolNegotiatorFactory clientProtocolNegotiatorFactory(
-      @Nullable ProtocolNegotiator fallbackNegotiator) {
-    return new ClientSdsProtocolNegotiatorFactory(fallbackNegotiator);
+  @After
+  public void tearDown() throws IOException, SQLException {
+    sqliteHelper.tearDown();
   }
 
-  /**
-   * Returns a {@link InternalProtocolNegotiator.ClientFactory} to be used on {@link
-   * NettyChannelBuilder}.
-   *
-   * @param fallbackNegotiator protocol negotiator to use as fallback.
-   */
-  public static InternalProtocolNegotiator.ClientFactory clientProtocolNegotiatorFactory(
-      @Nullable InternalProtocolNegotiator.ClientFactory fallbackNegotiator) {
-    return new ClientFactory(fallbackNegotiator);
+  @Test
+  public void correctBatching() throws SQLException {
+    final JdbcSinkConfig config = new JdbcSinkConfig(props);
+
+    final String url = sqliteHelper.sqliteUri();
+    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+    final DbStructure dbStructure = new DbStructure(dbDialect);
+
+    final TableId tableId = new TableId(null, null, "dummy");
+    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
+
+    final Schema schemaA = SchemaBuilder.struct()
+        .field("name", Schema.STRING_SCHEMA)
+        .build();
+    final Struct valueA = new Struct(schemaA)
+        .put("name", "cuba");
+    final SinkRecord recordA = new SinkRecord("dummy", 0, null, null, schemaA, valueA, 0);
+
+    final Schema schemaB = SchemaBuilder.struct()
+        .field("name", Schema.STRING_SCHEMA)
+        .field("age", Schema.OPTIONAL_INT32_SCHEMA)
+        .build();
+    final Struct valueB = new Struct(schemaB)
+        .put("name", "cuba")
+        .put("age", 4);
+    final SinkRecord recordB = new SinkRecord("dummy", 1, null, null, schemaB, valueB, 1);
+
+    // test records are batched correctly based on schema equality as records are added
+    //   (schemaA,schemaA,schemaA,schemaB,schemaA) -> ([schemaA,schemaA,schemaA],[schemaB],[schemaA])
+
+    assertEquals(Collections.emptyList(), buffer.add(recordA));
+    assertEquals(Collections.emptyList(), buffer.add(recordA));
+    assertEquals(Collections.emptyList(), buffer.add(recordA));
+
+    assertEquals(Arrays.asList(recordA, recordA, recordA), buffer.add(recordB));
+
+    assertEquals(Collections.singletonList(recordB), buffer.add(recordA));
+
+    assertEquals(Collections.singletonList(recordA), buffer.flush());
   }
 
-  public static InternalProtocolNegotiator.ServerFactory serverProtocolNegotiatorFactory(
-      @Nullable InternalProtocolNegotiator.ServerFactory fallbackNegotiator) {
-    return new ServerFactory(fallbackNegotiator);
+  @Test(expected = ConfigException.class)
+  public void configParsingFailsIfDeleteWithWrongPKMode() {
+    props.put("delete.enabled", true);
+    props.put("insert.mode", "upsert");
+    props.put("pk.mode", "kafka"); // wrong pk mode for deletes
+    new JdbcSinkConfig(props);
   }
 
-  /**
-   * Creates an SDS based {@link ProtocolNegotiator} for a {@link io.grpc.netty.NettyServerBuilder}.
-   * If xDS returns no DownstreamTlsContext, it will fall back to plaintext.
-   *
-   * @param fallbackProtocolNegotiator protocol negotiator to use as fallback.
-   */
-  public static ServerSdsProtocolNegotiator serverProtocolNegotiator(
-      @Nullable ProtocolNegotiator fallbackProtocolNegotiator) {
-    return new ServerSdsProtocolNegotiator(fallbackProtocolNegotiator);
+  @Test
+  public void insertThenDeleteInBatchNoFlush() throws SQLException {
+    props.put("delete.enabled", true);
+    props.put("insert.mode", "upsert");
+    props.put("pk.mode", "record_key");
+    final JdbcSinkConfig config = new JdbcSinkConfig(props);
+
+    final String url = sqliteHelper.sqliteUri();
+    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+    final DbStructure dbStructure = new DbStructure(dbDialect);
+
+    final TableId tableId = new TableId(null, null, "dummy");
+    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
+
+    final Schema keySchemaA = SchemaBuilder.struct()
+        .field("id", Schema.INT64_SCHEMA)
+        .build();
+    final Schema valueSchemaA = SchemaBuilder.struct()
+        .field("name", Schema.STRING_SCHEMA)
+        .build();
+    final Struct keyA = new Struct(keySchemaA)
+        .put("id", 1234L);
+    final Struct valueA = new Struct(valueSchemaA)
+        .put("name", "cuba");
+    final SinkRecord recordA = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, valueA, 0);
+    final SinkRecord recordADelete = new SinkRecord("dummy", 0, keySchemaA, keyA, null, null, 0);
+
+    final Schema schemaB = SchemaBuilder.struct()
+        .field("name", Schema.STRING_SCHEMA)
+        .field("age", Schema.OPTIONAL_INT32_SCHEMA)
+        .build();
+    final Struct valueB = new Struct(schemaB)
+        .put("name", "cuba")
+        .put("age", 4);
+    final SinkRecord recordB = new SinkRecord("dummy", 1, keySchemaA, keyA, schemaB, valueB, 1);
+
+    // test records are batched correctly based on schema equality as records are added
+    //   (schemaA,schemaA,schemaA,schemaB,schemaA) -> ([schemaA,schemaA,schemaA],[schemaB],[schemaA])
+
+    assertEquals(Collections.emptyList(), buffer.add(recordA));
+    assertEquals(Collections.emptyList(), buffer.add(recordA));
+
+    // delete should not cause a flush (i.e. not treated as a schema change)
+    assertEquals(Collections.emptyList(), buffer.add(recordADelete));
+
+    // schema change should trigger flush
+    assertEquals(Arrays.asList(recordA, recordA, recordADelete), buffer.add(recordB));
+
+    // second schema change should trigger flush
+    assertEquals(Collections.singletonList(recordB), buffer.add(recordA));
+
+    assertEquals(Collections.singletonList(recordA), buffer.flush());
   }
 
-  private static final class ServerFactory implements InternalProtocolNegotiator.ServerFactory {
+  @Test
+  public void insertThenTwoDeletesWithSchemaInBatchNoFlush() throws SQLException {
+	    props.put("delete.enabled", true);
+	    props.put("insert.mode", "upsert");
+	    props.put("pk.mode", "record_key");
+	    final JdbcSinkConfig config = new JdbcSinkConfig(props);
 
-    private final InternalProtocolNegotiator.ServerFactory fallbackProtocolNegotiator;
+	    final String url = sqliteHelper.sqliteUri();
+	    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+	    final DbStructure dbStructure = new DbStructure(dbDialect);
 
-    private ServerFactory(InternalProtocolNegotiator.ServerFactory fallbackNegotiator) {
-      this.fallbackProtocolNegotiator = fallbackNegotiator;
-    }
+	    final TableId tableId = new TableId(null, null, "dummy");
+	    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
 
-    @Override
-    public ProtocolNegotiator newNegotiator(ObjectPool<? extends Executor> offloadExecutorPool) {
-      return new ServerSdsProtocolNegotiator(
-          fallbackProtocolNegotiator.newNegotiator(offloadExecutorPool));
-    }
+	    final Schema keySchemaA = SchemaBuilder.struct()
+	        .field("id", Schema.INT64_SCHEMA)
+	        .build();
+	    final Schema valueSchemaA = SchemaBuilder.struct()
+	        .field("name", Schema.STRING_SCHEMA)
+	        .build();
+	    final Struct keyA = new Struct(keySchemaA)
+	        .put("id", 1234L);
+	    final Struct valueA = new Struct(valueSchemaA)
+	        .put("name", "cuba");
+	    final SinkRecord recordA = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, valueA, 0);
+	    final SinkRecord recordADeleteWithSchema = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, null, 0);
+	    final SinkRecord recordADelete = new SinkRecord("dummy", 0, keySchemaA, keyA, null, null, 0);
+
+	    final Schema schemaB = SchemaBuilder.struct()
+	        .field("name", Schema.STRING_SCHEMA)
+	        .field("age", Schema.OPTIONAL_INT32_SCHEMA)
+	        .build();
+	    final Struct valueB = new Struct(schemaB)
+	        .put("name", "cuba")
+	        .put("age", 4);
+	    final SinkRecord recordB = new SinkRecord("dummy", 1, keySchemaA, keyA, schemaB, valueB, 1);
+
+	    // test records are batched correctly based on schema equality as records are added
+	    //   (schemaA,schemaA,schemaA,schemaB,schemaA) -> ([schemaA,schemaA,schemaA],[schemaB],[schemaA])
+
+	    assertEquals(Collections.emptyList(), buffer.add(recordA));
+	    assertEquals(Collections.emptyList(), buffer.add(recordA));
+
+	    // delete should not cause a flush (i.e. not treated as a schema change)
+	    assertEquals(Collections.emptyList(), buffer.add(recordADeleteWithSchema));
+
+	    // delete should not cause a flush (i.e. not treated as a schema change)
+	    assertEquals(Collections.emptyList(), buffer.add(recordADelete));
+	    
+	    // schema change and/or previous deletes should trigger flush
+	    assertEquals(Arrays.asList(recordA, recordA, recordADeleteWithSchema, recordADelete), buffer.add(recordB));
+
+	    // second schema change should trigger flush
+	    assertEquals(Collections.singletonList(recordB), buffer.add(recordA));
+
+	    assertEquals(Collections.singletonList(recordA), buffer.flush());
+  }
+  
+  @Test
+  public void insertThenDeleteThenInsertInBatchFlush() throws SQLException {
+    props.put("delete.enabled", true);
+    props.put("insert.mode", "upsert");
+    props.put("pk.mode", "record_key");
+    final JdbcSinkConfig config = new JdbcSinkConfig(props);
+
+    final String url = sqliteHelper.sqliteUri();
+    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+    final DbStructure dbStructure = new DbStructure(dbDialect);
+
+    final TableId tableId = new TableId(null, null, "dummy");
+    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
+
+    final Schema keySchemaA = SchemaBuilder.struct()
+        .field("id", Schema.INT64_SCHEMA)
+        .build();
+    final Schema valueSchemaA = SchemaBuilder.struct()
+        .field("name", Schema.STRING_SCHEMA)
+        .build();
+    final Struct keyA = new Struct(keySchemaA)
+        .put("id", 1234L);
+    final Struct valueA = new Struct(valueSchemaA)
+        .put("name", "cuba");
+    final SinkRecord recordA = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, valueA, 0);
+    final SinkRecord recordADelete = new SinkRecord("dummy", 0, keySchemaA, keyA, null, null, 0);
+
+    final Schema schemaB = SchemaBuilder.struct()
+        .field("name", Schema.STRING_SCHEMA)
+        .field("age", Schema.OPTIONAL_INT32_SCHEMA)
+        .build();
+    final Struct valueB = new Struct(schemaB)
+        .put("name", "cuba")
+        .put("age", 4);
+    final SinkRecord recordB = new SinkRecord("dummy", 1, keySchemaA, keyA, schemaB, valueB, 1);
+
+    assertEquals(Collections.emptyList(), buffer.add(recordA));
+    assertEquals(Collections.emptyList(), buffer.add(recordA));
+
+    // delete should not cause a flush (i.e. not treated as a schema change)
+    assertEquals(Collections.emptyList(), buffer.add(recordADelete));
+
+    // insert after delete should flush to insure insert isn't lost in batching
+    assertEquals(Arrays.asList(recordA, recordA, recordADelete), buffer.add(recordA));
+
+    // schema change should trigger flush
+    assertEquals(Collections.singletonList(recordA), buffer.add(recordB));
+
+    // second schema change should trigger flush
+    assertEquals(Collections.singletonList(recordB), buffer.add(recordA));
+
+    assertEquals(Collections.singletonList(recordA), buffer.flush());
   }
 
-  private static final class ClientFactory implements InternalProtocolNegotiator.ClientFactory {
+  @Test
+  public void insertThenDeleteWithSchemaThenInsertInBatchFlush() throws SQLException {
+	    props.put("delete.enabled", true);
+	    props.put("insert.mode", "upsert");
+	    props.put("pk.mode", "record_key");
+	    final JdbcSinkConfig config = new JdbcSinkConfig(props);
 
-    private final InternalProtocolNegotiator.ClientFactory fallbackProtocolNegotiator;
+	    final String url = sqliteHelper.sqliteUri();
+	    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+	    final DbStructure dbStructure = new DbStructure(dbDialect);
 
-    private ClientFactory(InternalProtocolNegotiator.ClientFactory fallbackNegotiator) {
-      this.fallbackProtocolNegotiator = fallbackNegotiator;
-    }
+	    final TableId tableId = new TableId(null, null, "dummy");
+	    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
 
-    @Override
-    public ProtocolNegotiator newNegotiator() {
-      return new ClientSdsProtocolNegotiator(fallbackProtocolNegotiator.newNegotiator());
-    }
+	    final Schema keySchemaA = SchemaBuilder.struct()
+	        .field("id", Schema.INT64_SCHEMA)
+	        .build();
+	    final Schema valueSchemaA = SchemaBuilder.struct()
+	        .field("name", Schema.STRING_SCHEMA)
+	        .build();
+	    final Struct keyA = new Struct(keySchemaA)
+	        .put("id", 1234L);
+	    final Struct valueA = new Struct(valueSchemaA)
+	        .put("name", "cuba");
+	    final SinkRecord recordA = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, valueA, 0);
+	    final SinkRecord recordADeleteWithSchema = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, null, 0);
 
-    @Override
-    public int getDefaultPort() {
-      return GrpcUtil.DEFAULT_PORT_SSL;
-    }
+	    final Schema schemaB = SchemaBuilder.struct()
+	        .field("name", Schema.STRING_SCHEMA)
+	        .field("age", Schema.OPTIONAL_INT32_SCHEMA)
+	        .build();
+	    final Struct valueB = new Struct(schemaB)
+	        .put("name", "cuba")
+	        .put("age", 4);
+	    final SinkRecord recordB = new SinkRecord("dummy", 1, keySchemaA, keyA, schemaB, valueB, 1);
+
+	    assertEquals(Collections.emptyList(), buffer.add(recordA));
+	    assertEquals(Collections.emptyList(), buffer.add(recordA));
+
+	    // delete should not cause a flush (i.e. not treated as a schema change)
+	    assertEquals(Collections.emptyList(), buffer.add(recordADeleteWithSchema));
+
+	    // insert after delete should flush to insure insert isn't lost in batching
+	    assertEquals(Arrays.asList(recordA, recordA, recordADeleteWithSchema), buffer.add(recordA));
+
+	    // schema change should trigger flush
+	    assertEquals(Collections.singletonList(recordA), buffer.add(recordB));
+
+	    // second schema change should trigger flush
+	    assertEquals(Collections.singletonList(recordB), buffer.add(recordA));
+
+	    assertEquals(Collections.singletonList(recordA), buffer.flush());
+  }
+  
+  @Test
+  public void testMultipleDeletesBatchedTogether() throws SQLException {
+    props.put("delete.enabled", true);
+    props.put("insert.mode", "upsert");
+    props.put("pk.mode", "record_key");
+    final JdbcSinkConfig config = new JdbcSinkConfig(props);
+
+    final String url = sqliteHelper.sqliteUri();
+    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+    final DbStructure dbStructure = new DbStructure(dbDialect);
+
+    final TableId tableId = new TableId(null, null, "dummy");
+    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
+
+    final Schema keySchemaA = SchemaBuilder.struct()
+        .field("id", Schema.INT64_SCHEMA)
+        .build();
+    final Schema valueSchemaA = SchemaBuilder.struct()
+        .field("name", Schema.STRING_SCHEMA)
+        .build();
+    final Struct keyA = new Struct(keySchemaA)
+        .put("id", 1234L);
+    final Struct valueA = new Struct(valueSchemaA)
+        .put("name", "cuba");
+    final SinkRecord recordA = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, valueA, 0);
+    final SinkRecord recordADelete = new SinkRecord("dummy", 0, keySchemaA, keyA, null, null, 0);
+
+    final Schema schemaB = SchemaBuilder.struct()
+        .field("name", Schema.STRING_SCHEMA)
+        .field("age", Schema.OPTIONAL_INT32_SCHEMA)
+        .build();
+    final Struct valueB = new Struct(schemaB)
+        .put("name", "cuba")
+        .put("age", 4);
+    final SinkRecord recordB = new SinkRecord("dummy", 1, keySchemaA, keyA, schemaB, valueB, 1);
+    final SinkRecord recordBDelete = new SinkRecord("dummy", 1, keySchemaA, keyA, null, null, 1);
+
+    assertEquals(Collections.emptyList(), buffer.add(recordA));
+
+    // schema change should trigger flush
+    assertEquals(Collections.singletonList(recordA), buffer.add(recordB));
+
+    // deletes should not cause a flush (i.e. not treated as a schema change)
+    assertEquals(Collections.emptyList(), buffer.add(recordADelete));
+    assertEquals(Collections.emptyList(), buffer.add(recordBDelete));
+
+    // insert after delete should flush to insure insert isn't lost in batching
+    assertEquals(Arrays.asList(recordB, recordADelete, recordBDelete), buffer.add(recordB));
+
+    assertEquals(Collections.singletonList(recordB), buffer.flush());
   }
 
-  private static final class ClientSdsProtocolNegotiatorFactory
-      implements InternalNettyChannelBuilder.ProtocolNegotiatorFactory {
+  @Test
+  public void testMultipleDeletesWithSchemaBatchedTogether() throws SQLException {
+	    props.put("delete.enabled", true);
+	    props.put("insert.mode", "upsert");
+	    props.put("pk.mode", "record_key");
+	    final JdbcSinkConfig config = new JdbcSinkConfig(props);
 
-    private final ProtocolNegotiator fallbackProtocolNegotiator;
+	    final String url = sqliteHelper.sqliteUri();
+	    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+	    final DbStructure dbStructure = new DbStructure(dbDialect);
 
-    private ClientSdsProtocolNegotiatorFactory(ProtocolNegotiator fallbackNegotiator) {
-      this.fallbackProtocolNegotiator = fallbackNegotiator;
-    }
+	    final TableId tableId = new TableId(null, null, "dummy");
+	    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
 
-    @Override
-    public InternalProtocolNegotiator.ProtocolNegotiator buildProtocolNegotiator() {
-      final ClientSdsProtocolNegotiator negotiator =
-          new ClientSdsProtocolNegotiator(fallbackProtocolNegotiator);
-      final class LocalSdsNegotiator implements InternalProtocolNegotiator.ProtocolNegotiator {
+	    final Schema keySchemaA = SchemaBuilder.struct()
+	        .field("id", Schema.INT64_SCHEMA)
+	        .build();
+	    final Schema valueSchemaA = SchemaBuilder.struct()
+	        .field("name", Schema.STRING_SCHEMA)
+	        .build();
+	    final Struct keyA = new Struct(keySchemaA)
+	        .put("id", 1234L);
+	    final Struct valueA = new Struct(valueSchemaA)
+	        .put("name", "cuba");
+	    final SinkRecord recordA = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, valueA, 0);
+	    final SinkRecord recordADeleteWithSchema = new SinkRecord("dummy", 0, keySchemaA, keyA, valueSchemaA, null, 0);
 
-        @Override
-        public AsciiString scheme() {
-          return negotiator.scheme();
-        }
+	    final Schema schemaB = SchemaBuilder.struct()
+	        .field("name", Schema.STRING_SCHEMA)
+	        .field("age", Schema.OPTIONAL_INT32_SCHEMA)
+	        .build();
+	    final Struct valueB = new Struct(schemaB)
+	        .put("name", "cuba")
+	        .put("age", 4);
+	    final SinkRecord recordB = new SinkRecord("dummy", 1, keySchemaA, keyA, schemaB, valueB, 1);
+	    final SinkRecord recordBDeleteWithSchema = new SinkRecord("dummy", 1, keySchemaA, keyA, schemaB, null, 1);
 
-        @Override
-        public ChannelHandler newHandler(GrpcHttp2ConnectionHandler grpcHandler) {
-          return negotiator.newHandler(grpcHandler);
-        }
+	    assertEquals(Collections.emptyList(), buffer.add(recordA));
 
-        @Override
-        public void close() {
-          negotiator.close();
-        }
-      }
+	    // schema change should trigger flush
+	    assertEquals(Collections.singletonList(recordA), buffer.add(recordB));
 
-      return new LocalSdsNegotiator();
-    }
+	    // schema change should trigger flush
+	    assertEquals(Collections.singletonList(recordB), buffer.add(recordADeleteWithSchema));
+	    
+	    // schema change should trigger flush
+	    assertEquals(Collections.singletonList(recordADeleteWithSchema), buffer.add(recordBDeleteWithSchema));
+
+	    // insert after delete should flush to insure insert isn't lost in batching
+	    assertEquals(Collections.singletonList(recordBDeleteWithSchema), buffer.add(recordB));
+
+	    assertEquals(Collections.singletonList(recordB), buffer.flush());
+  }
+  
+  @Test
+  public void testFlushSuccessNoInfo() throws SQLException {
+    final String url = sqliteHelper.sqliteUri();
+    final JdbcSinkConfig config = new JdbcSinkConfig(props);
+
+    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+
+    int[] batchResponse = new int[2];
+    batchResponse[0] = Statement.SUCCESS_NO_INFO;
+    batchResponse[1] = Statement.SUCCESS_NO_INFO;
+
+    final DbStructure dbStructureMock = mock(DbStructure.class);
+    when(dbStructureMock.createOrAmendIfNecessary(Matchers.any(JdbcSinkConfig.class),
+                                                  Matchers.any(Connection.class),
+                                                  Matchers.any(TableId.class),
+                                                  Matchers.any(FieldsMetadata.class)))
+        .thenReturn(true);
+
+    PreparedStatement preparedStatementMock = mock(PreparedStatement.class);
+    when(preparedStatementMock.executeBatch()).thenReturn(batchResponse);
+
+    Connection connectionMock = mock(Connection.class);
+    when(connectionMock.prepareStatement(Matchers.anyString())).thenReturn(preparedStatementMock);
+
+    final TableId tableId = new TableId(null, null, "dummy");
+    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect,
+                                                       dbStructureMock, connectionMock);
+
+    final Schema schemaA = SchemaBuilder.struct().field("name", Schema.STRING_SCHEMA).build();
+    final Struct valueA = new Struct(schemaA).put("name", "cuba");
+    final SinkRecord recordA = new SinkRecord("dummy", 0, null, null, schemaA, valueA, 0);
+    buffer.add(recordA);
+
+    final Schema schemaB = SchemaBuilder.struct().field("name", Schema.STRING_SCHEMA).build();
+    final Struct valueB = new Struct(schemaA).put("name", "cubb");
+    final SinkRecord recordB = new SinkRecord("dummy", 0, null, null, schemaB, valueB, 0);
+    buffer.add(recordB);
+    buffer.flush();
+
   }
 
-  @VisibleForTesting
-  static final class ClientSdsProtocolNegotiator implements ProtocolNegotiator {
 
-    @Nullable private final ProtocolNegotiator fallbackProtocolNegotiator;
+  @Test
+  public void testInsertModeUpdate() throws SQLException {
+    final String url = sqliteHelper.sqliteUri();
+    props.put("insert.mode", "update");
+    final JdbcSinkConfig config = new JdbcSinkConfig(props);
 
-    ClientSdsProtocolNegotiator(@Nullable ProtocolNegotiator fallbackProtocolNegotiator) {
-      this.fallbackProtocolNegotiator = fallbackProtocolNegotiator;
-    }
+    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+    assertTrue(dbDialect instanceof SqliteDatabaseDialect);
+    final DbStructure dbStructureMock = mock(DbStructure.class);
+    when(dbStructureMock.createOrAmendIfNecessary(Matchers.any(JdbcSinkConfig.class),
+                                                  Matchers.any(Connection.class),
+                                                  Matchers.any(TableId.class),
+                                                  Matchers.any(FieldsMetadata.class)))
+        .thenReturn(true);
 
-    @Override
-    public AsciiString scheme() {
-      return SCHEME;
-    }
+    final Connection connectionMock = mock(Connection.class);
+    final TableId tableId = new TableId(null, null, "dummy");
+    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructureMock,
+            connectionMock);
 
-    @Override
-    public ChannelHandler newHandler(GrpcHttp2ConnectionHandler grpcHandler) {
-      // check if SslContextProviderSupplier was passed via attributes
-      SslContextProviderSupplier localSslContextProviderSupplier =
-          grpcHandler.getEagAttributes().get(
-              InternalXdsAttributes.ATTR_SSL_CONTEXT_PROVIDER_SUPPLIER);
-      if (localSslContextProviderSupplier == null) {
-        checkNotNull(
-            fallbackProtocolNegotiator, "No TLS config and no fallbackProtocolNegotiator!");
-        return fallbackProtocolNegotiator.newHandler(grpcHandler);
-      }
-      return new ClientSdsHandler(grpcHandler, localSslContextProviderSupplier);
-    }
+    final Schema schemaA = SchemaBuilder.struct().field("name", Schema.STRING_SCHEMA).build();
+    final Struct valueA = new Struct(schemaA).put("name", "cuba");
+    final SinkRecord recordA = new SinkRecord("dummy", 0, null, null, schemaA, valueA, 0);
+    buffer.add(recordA);
 
-    @Override
-    public void close() {}
+    // Even though we're using the SQLite dialect, which uses backtick as the default quote
+    // character, the SQLite JDBC driver does return double quote as the quote characters.
+    Mockito.verify(
+        connectionMock,
+        Mockito.times(1)
+    ).prepareStatement(Matchers.eq("UPDATE \"dummy\" SET \"name\" = ?"));
+
   }
 
-  private static class BufferReadsHandler extends ChannelInboundHandlerAdapter {
-    private final List<Object> reads = new ArrayList<>();
-    private boolean readComplete;
+  @Test
+  public void testAddRecordDeleteNotEnabledAndNonePkMode() throws SQLException {
+    props.put("pk.mode", "none");
 
-    @Override
-    public void channelRead(ChannelHandlerContext ctx, Object msg) {
-      reads.add(msg);
-    }
+    // Delete is not enabled, so therefore require non-null value and value schema,
+    // but any combination of key and key schema works
+    assertValidRecord(true, true, true, true);
+    assertValidRecord(false, true, true, true);
+    assertValidRecord(true, false, true, true);
+    assertValidRecord(false, false, true, true);
 
-    @Override
-    public void channelReadComplete(ChannelHandlerContext ctx) {
-      readComplete = true;
-    }
+    // Fail when null value
+    assertInvalidRecord(false, false, false, false, "with a null value and null value schema");
+    assertInvalidRecord(true, false, false, false, "with a null value and null value schema");
+    assertInvalidRecord(false, true, false, false, "with a null value and null value schema");
+    assertInvalidRecord(true, true, false, false, "with a null value and null value schema");
+    assertInvalidRecord(false, false, true, false, "with a null value and Struct value schema");
+    assertInvalidRecord(true, false, true, false, "with a null value and Struct value schema");
+    assertInvalidRecord(false, true, true, false, "with a null value and Struct value schema");
+    assertInvalidRecord(true, true, true, false, "with a null value and Struct value schema");
 
-    @Override
-    public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
-      for (Object msg : reads) {
-        super.channelRead(ctx, msg);
-      }
-      if (readComplete) {
-        super.channelReadComplete(ctx);
-      }
-    }
-
-    @Override
-    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-      logger.log(Level.SEVERE, "exceptionCaught", cause);
-      ctx.fireExceptionCaught(cause);
-    }
+    // Fail when null value schema but non-null value
+    assertInvalidRecord(false, false, false, true, "with a Struct value and null value schema");
+    assertInvalidRecord(true, false, false, true, "with a Struct value and null value schema");
+    assertInvalidRecord(false, true, false, true, "with a Struct value and null value schema");
+    assertInvalidRecord(true, true, false, true, "with a Struct value and null value schema");
   }
 
-  @VisibleForTesting
-  static final class ClientSdsHandler
-      extends InternalProtocolNegotiators.ProtocolNegotiationHandler {
-    private final GrpcHttp2ConnectionHandler grpcHandler;
-    private final SslContextProviderSupplier sslContextProviderSupplier;
+  @Test
+  public void testAddRecordDeleteNotEnabledAndRecordKeyPkMode() throws SQLException {
+    props.put("pk.mode", "record_key");
+    props.put("pk.fields", "id");
 
-    ClientSdsHandler(
-        GrpcHttp2ConnectionHandler grpcHandler,
-        SslContextProviderSupplier sslContextProviderSupplier) {
-      super(
-          // superclass (InternalProtocolNegotiators.ProtocolNegotiationHandler) expects 'next'
-          // handler but we don't have a next handler _yet_. So we "disable" superclass's behavior
-          // here and then manually add 'next' when we call fireProtocolNegotiationEvent()
-          new ChannelHandlerAdapter() {
-            @Override
-            public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
-              ctx.pipeline().remove(this);
-            }
-          });
-      checkNotNull(grpcHandler, "grpcHandler");
-      this.grpcHandler = grpcHandler;
-      this.sslContextProviderSupplier = sslContextProviderSupplier;
-    }
+    // Delete is not enabled, so therefore require non-null key and values with schemas
+    assertValidRecord(true, true, true, true);
+    // Fail when ingesting tombstones
+    assertInvalidRecord(true, true, false, true, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(true, true, true, false, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(true, true, false, false, "with a non-null Struct value and non-null Struct schema");
 
-    @Override
-    protected void handlerAdded0(final ChannelHandlerContext ctx) {
-      final BufferReadsHandler bufferReads = new BufferReadsHandler();
-      ctx.pipeline().addBefore(ctx.name(), null, bufferReads);
+    // Fail when null key and null key schema
+    assertInvalidRecord(false, false, true, true, "with a null key and null key schema");
+    assertInvalidRecord(false, false, false, true, "with a null key and null key schema");
+    assertInvalidRecord(false, false, false, false, "with a null key and null key schema");
 
-      sslContextProviderSupplier.updateSslContext(
-          new SslContextProvider.Callback(ctx.executor()) {
+    // Fail when null key and non-null key schema
+    assertInvalidRecord(true, false, true, true, "with a null key and Struct key schema");
+    assertInvalidRecord(true, false, false, true, "with a null key and Struct key schema");
+    assertInvalidRecord(true, false, false, false, "with a null key and Struct key schema");
 
-            @Override
-            public void updateSecret(SslContext sslContext) {
-              logger.log(
-                  Level.FINEST,
-                  "ClientSdsHandler.updateSecret authority={0}, ctx.name={1}",
-                  new Object[]{grpcHandler.getAuthority(), ctx.name()});
-              ChannelHandler handler =
-                  InternalProtocolNegotiators.tls(sslContext).newHandler(grpcHandler);
-
-              // Delegate rest of handshake to TLS handler
-              ctx.pipeline().addAfter(ctx.name(), null, handler);
-              fireProtocolNegotiationEvent(ctx);
-              ctx.pipeline().remove(bufferReads);
-            }
-
-            @Override
-            public void onException(Throwable throwable) {
-              ctx.fireExceptionCaught(throwable);
-            }
-          }
-      );
-    }
-
-    @Override
-    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause)
-        throws Exception {
-      logger.log(Level.SEVERE, "exceptionCaught", cause);
-      ctx.fireExceptionCaught(cause);
-    }
+    // Fail when non-null key and null key schema
+    assertInvalidRecord(false, true, true, true, "with a Struct key and null key schema");
+    assertInvalidRecord(false, true, false, true, "with a Struct key and null key schema");
+    assertInvalidRecord(false, true, false, false, "with a Struct key and null key schema");
   }
 
-  @VisibleForTesting
-  public static final class ServerSdsProtocolNegotiator implements ProtocolNegotiator {
+  @Test
+  public void testAddRecordDeleteNotEnabledAndRecordValuePkMode() throws SQLException {
+    props.put("pk.mode", "record_value");
+    props.put("pk.fields", "name");
 
-    @Nullable private final ProtocolNegotiator fallbackProtocolNegotiator;
+    // Delete is not enabled, so therefore require non-null value and value schema,
+    // but any combination of key and key schema works
+    assertValidRecord(true, true, true, true);
+    assertValidRecord(false, true, true, true);
+    assertValidRecord(true, false, true, true);
+    assertValidRecord(false, false, true, true);
 
-    /** Constructor. */
-    @VisibleForTesting
-    public ServerSdsProtocolNegotiator(@Nullable ProtocolNegotiator fallbackProtocolNegotiator) {
-      this.fallbackProtocolNegotiator = fallbackProtocolNegotiator;
-    }
+    // Fail when null value and null value schema
+    assertInvalidRecord(true, true, false, false, "with a null value and null value schema");
+    assertInvalidRecord(true, false, false, false, "with a null value and null value schema");
+    assertInvalidRecord(false, true, false, false, "with a null value and null value schema");
+    assertInvalidRecord(false, false, false, false, "with a null value and null value schema");
 
-    @Override
-    public AsciiString scheme() {
-      return SCHEME;
-    }
+    // Fail when null value and non-null value schema
+    assertInvalidRecord(true, true, true, false, "with a null value and Struct value schema");
+    assertInvalidRecord(true, false, true, false, "with a null value and Struct value schema");
+    assertInvalidRecord(false, true, true, false, "with a null value and Struct value schema");
+    assertInvalidRecord(false, false, true, false, "with a null value and Struct value schema");
 
-    @Override
-    public ChannelHandler newHandler(GrpcHttp2ConnectionHandler grpcHandler) {
-      XdsClientWrapperForServerSds xdsClientWrapperForServerSds =
-          grpcHandler.getEagAttributes().get(SERVER_XDS_CLIENT);
-      return new HandlerPickerHandler(grpcHandler, xdsClientWrapperForServerSds,
-          fallbackProtocolNegotiator);
-    }
-
-    @Override
-    public void close() {}
+    // Fail when non-null value and null value schema
+    assertInvalidRecord(true, true, false, true, "with a Struct value and null value schema");
+    assertInvalidRecord(true, false, false, true, "with a Struct value and null value schema");
+    assertInvalidRecord(false, true, false, true, "with a Struct value and null value schema");
+    assertInvalidRecord(false, false, false, true, "with a Struct value and null value schema");
   }
 
-  @VisibleForTesting
-  static final class HandlerPickerHandler
-      extends ChannelInboundHandlerAdapter {
-    private final GrpcHttp2ConnectionHandler grpcHandler;
-    private final XdsClientWrapperForServerSds xdsClientWrapperForServerSds;
-    @Nullable private final ProtocolNegotiator fallbackProtocolNegotiator;
+  @Test
+  public void testAddRecordDeleteNotEnabledAndKafkaPkMode() throws SQLException {
+    props.put("pk.mode", "kafka");
 
-    HandlerPickerHandler(
-        GrpcHttp2ConnectionHandler grpcHandler,
-        @Nullable XdsClientWrapperForServerSds xdsClientWrapperForServerSds,
-        ProtocolNegotiator fallbackProtocolNegotiator) {
-      this.grpcHandler = checkNotNull(grpcHandler, "grpcHandler");
-      this.xdsClientWrapperForServerSds = xdsClientWrapperForServerSds;
-      this.fallbackProtocolNegotiator = fallbackProtocolNegotiator;
-    }
+    // Delete is not enabled, so therefore allow all combinations of
+    // null and non-null key, key schema, value, and value schema
+    assertValidRecord(true, true, true, true);
+    assertValidRecord(false, true, true, true);
+    assertValidRecord(true, false, true, true);
+    assertValidRecord(false, false, true, true);
 
-    @Override
-    public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
-      if (evt instanceof ProtocolNegotiationEvent) {
-        DownstreamTlsContext downstreamTlsContext =
-            xdsClientWrapperForServerSds == null
-                ? null
-                : xdsClientWrapperForServerSds.getDownstreamTlsContext(ctx.channel());
-        if (downstreamTlsContext == null) {
-          if (fallbackProtocolNegotiator == null) {
-            ctx.fireExceptionCaught(new CertStoreException("No certificate source found!"));
-            return;
-          }
-          logger.log(Level.INFO, "Using fallback for {0}", ctx.channel().localAddress());
-          ctx.pipeline()
-              .replace(
-                  this,
-                  null,
-                  fallbackProtocolNegotiator.newHandler(grpcHandler));
-          ProtocolNegotiationEvent pne = InternalProtocolNegotiationEvent.getDefault();
-          ctx.fireUserEventTriggered(pne);
-          return;
-        } else {
-          ctx.pipeline()
-              .replace(
-                  this,
-                  null,
-                  new ServerSdsHandler(
-                      grpcHandler, downstreamTlsContext, fallbackProtocolNegotiator));
-          ProtocolNegotiationEvent pne = InternalProtocolNegotiationEvent.getDefault();
-          ctx.fireUserEventTriggered(pne);
-          return;
-        }
-      } else {
-        super.userEventTriggered(ctx, evt);
-      }
-    }
+    assertInvalidRecord(true, true, true, false, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(false, true, true, false, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(true, false, true, false, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(false, false, true, false, "with a non-null Struct value and non-null Struct schema");
+
+    assertInvalidRecord(true, true, false, true, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(false, true, false, true, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(true, false, false, true, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(false, false, false, true, "with a non-null Struct value and non-null Struct schema");
+
+    assertInvalidRecord(true, true, false, false, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(false, true, false, false, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(true, false, false, false, "with a non-null Struct value and non-null Struct schema");
+    assertInvalidRecord(false, false, false, false, "with a non-null Struct value and non-null Struct schema");
   }
 
-  @VisibleForTesting
-  static final class ServerSdsHandler
-          extends InternalProtocolNegotiators.ProtocolNegotiationHandler {
-    private final GrpcHttp2ConnectionHandler grpcHandler;
-    private final DownstreamTlsContext downstreamTlsContext;
-    @Nullable private final ProtocolNegotiator fallbackProtocolNegotiator;
+  @Test
+  public void testAddRecordDeleteEnabledAndNonePkMode() throws SQLException {
+    props.put("delete.enabled", true);
+    props.put("pk.mode", "none");
+    ConfigException e = assertThrows(ConfigException.class, () -> new JdbcSinkConfig(props));
+    assertEquals(
+        "Primary key mode must be 'record_key' when delete support is enabled",
+        e.getMessage()
+    );
+  }
 
-    ServerSdsHandler(
-            GrpcHttp2ConnectionHandler grpcHandler,
-            DownstreamTlsContext downstreamTlsContext,
-            ProtocolNegotiator fallbackProtocolNegotiator) {
-      super(
-          // superclass (InternalProtocolNegotiators.ProtocolNegotiationHandler) expects 'next'
-          // handler but we don't have a next handler _yet_. So we "disable" superclass's behavior
-          // here and then manually add 'next' when we call fireProtocolNegotiationEvent()
-          new ChannelHandlerAdapter() {
-            @Override
-            public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
-              ctx.pipeline().remove(this);
-            }
-          });
-      checkNotNull(grpcHandler, "grpcHandler");
-      this.grpcHandler = grpcHandler;
-      this.downstreamTlsContext = downstreamTlsContext;
-      this.fallbackProtocolNegotiator = fallbackProtocolNegotiator;
-    }
+  @Test
+  public void testAddRecordDeleteEnabledAndRecordValuePkMode() throws SQLException {
+    props.put("delete.enabled", true);
+    props.put("pk.mode", "record_value");
+    props.put("pk.fields", "name");
+    ConfigException e = assertThrows(ConfigException.class, () -> new JdbcSinkConfig(props));
+    assertEquals(
+        "Primary key mode must be 'record_key' when delete support is enabled",
+        e.getMessage()
+    );
+  }
 
-    @Override
-    protected void handlerAdded0(final ChannelHandlerContext ctx) {
-      final BufferReadsHandler bufferReads = new BufferReadsHandler();
-      ctx.pipeline().addBefore(ctx.name(), null, bufferReads);
+  @Test
+  public void testAddRecordDeleteEnabledAndKafkaPkMode() throws SQLException {
+    props.put("delete.enabled", true);
+    props.put("pk.mode", "kafka");
+    ConfigException e = assertThrows(ConfigException.class, () -> new JdbcSinkConfig(props));
+    assertEquals(
+        "Primary key mode must be 'record_key' when delete support is enabled",
+        e.getMessage()
+    );
+  }
 
-      SslContextProvider sslContextProviderTemp = null;
-      try {
-        sslContextProviderTemp =
-            TlsContextManagerImpl.getInstance()
-                .findOrCreateServerSslContextProvider(downstreamTlsContext);
-      } catch (Exception e) {
-        if (fallbackProtocolNegotiator == null) {
-          ctx.fireExceptionCaught(new CertStoreException("No certificate source found!", e));
-          return;
-        }
-        logger.log(Level.INFO, "Using fallback for {0}", ctx.channel().localAddress());
-        // Delegate rest of handshake to fallback handler
-        ctx.pipeline().replace(this, null, fallbackProtocolNegotiator.newHandler(grpcHandler));
-        ctx.pipeline().remove(bufferReads);
-        return;
-      }
-      final SslContextProvider sslContextProvider = sslContextProviderTemp;
-      sslContextProvider.addCallback(
-          new SslContextProvider.Callback(ctx.executor()) {
+  @Test
+  public void testAddRecordDeleteEnabledAndRecordKeyPkMode() throws SQLException {
+    // Enabling delete requires 'record_key' pk mode
+    props.put("delete.enabled", true);
+    props.put("pk.mode", "record_key");
+    props.put("pk.fields", "id");
 
-            @Override
-            public void updateSecret(SslContext sslContext) {
-              ChannelHandler handler =
-                  InternalProtocolNegotiators.serverTls(sslContext).newHandler(grpcHandler);
+    // Non-null key schema and key, but with various combinations of value schema and value
+    assertValidRecord(true, true, true, true);
+    assertValidRecord(true, true, true, true);
+    assertValidRecord(true, true, false, false);
+    assertValidRecord(true, true, false, false);
 
-              // Delegate rest of handshake to TLS handler
-              if (!ctx.isRemoved()) {
-                ctx.pipeline().addAfter(ctx.name(), null, handler);
-                fireProtocolNegotiationEvent(ctx);
-                ctx.pipeline().remove(bufferReads);
-              }
-              TlsContextManagerImpl.getInstance()
-                  .releaseServerSslContextProvider(sslContextProvider);
-            }
+    // Invalid when null key and null key schema
+    assertInvalidRecord(false, false, true, true, "with a null key");
+    assertInvalidRecord(false, false, false, true, "with a null key");
+    assertInvalidRecord(false, false, true, false, "with a null key");
+    assertInvalidRecord(false, false, false, false, "with a null key");
 
-            @Override
-            public void onException(Throwable throwable) {
-              ctx.fireExceptionCaught(throwable);
-            }
-          }
-      );
-    }
+    // Invalid when null key and non-null key schema
+    assertInvalidRecord(true, false, true, true, "with a null key");
+    assertInvalidRecord(true, false, false, true, "with a null key");
+    assertInvalidRecord(true, false, true, false, "with a null key");
+    assertInvalidRecord(true, false, false, false, "with a null key");
+
+    // Invalid when non-null key and null key schema
+    assertInvalidRecord(false, true, true, true, "with a Struct key and null key schema");
+    assertInvalidRecord(false, true, false, true, "with a Struct key and null key schema");
+    assertInvalidRecord(false, true, true, true, "with a Struct key and null key schema");
+    assertInvalidRecord(false, true, false, false, "with a Struct key and null key schema");
+  }
+
+  protected SinkRecord generateRecord(
+      boolean includeKeySchema,
+      boolean includeKey,
+      boolean includeValueSchema,
+      boolean includeValue
+  ) {
+    Schema keySchema = SchemaBuilder.struct()
+                                      .field("id", Schema.INT32_SCHEMA)
+                                      .build();
+    Schema valueSchema = SchemaBuilder.struct()
+                                      .field("name", Schema.STRING_SCHEMA)
+                                      .build();
+    Schema keySchemaForRecord = includeKeySchema ? keySchema : null;
+    Schema valueSchemaForRecord = includeValueSchema ? valueSchema : null;
+    final Object key = includeKey ? new Struct(keySchema).put("id", 100) : null;
+    final Object valueA = includeValue ? new Struct(valueSchema).put("name", "cuba") : null;
+    return new SinkRecord("dummy", 0, keySchemaForRecord, key, valueSchemaForRecord, valueA, 0);
+  }
+
+  protected void assertInvalidRecord(
+      boolean includeKeySchema,
+      boolean includeKey,
+      boolean includeValueSchema,
+      boolean includeValue,
+      String errorMessageFragment
+  ) {
+    assertInvalidRecord(
+        generateRecord(includeKeySchema, includeKey, includeValueSchema, includeValue),
+        errorMessageFragment
+    );
+  }
+
+  protected void assertInvalidRecord(SinkRecord record, String errorMessageFragment) {
+    final JdbcSinkConfig config = new JdbcSinkConfig(props);
+
+    final String url = sqliteHelper.sqliteUri();
+    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+    final DbStructure dbStructure = new DbStructure(dbDialect);
+
+    final TableId tableId = new TableId(null, null, "dummy");
+    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
+
+    ConnectException e = assertThrows(ConnectException.class, () -> {
+      buffer.add(record);
+      buffer.flush();
+    });
+    assertTrue(
+        "Unexpected message: " + e.getMessage(),
+        e.getMessage().contains(errorMessageFragment)
+    );
+  }
+
+  protected void assertValidRecord(
+      boolean includeKeySchema,
+      boolean includeKey,
+      boolean includeValueSchema,
+      boolean includeValue
+  ) throws SQLException {
+    assertValidRecord(
+        generateRecord(includeKeySchema, includeKey, includeValueSchema, includeValue)
+    );
+  }
+
+  protected void assertValidRecord(SinkRecord record) throws SQLException {
+    props.put("batch.size", 2);
+    final JdbcSinkConfig config = new JdbcSinkConfig(props);
+
+    final String url = sqliteHelper.sqliteUri();
+    final DatabaseDialect dbDialect = DatabaseDialects.findBestFor(url, config);
+    final DbStructure dbStructure = new DbStructure(dbDialect);
+
+    final TableId tableId = new TableId(null, null, "dummy");
+    final BufferedRecords buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, sqliteHelper.connection);
+
+    List<SinkRecord> flushed = buffer.add(record);
+    assertEquals(Collections.emptyList(), flushed);
   }
 }
